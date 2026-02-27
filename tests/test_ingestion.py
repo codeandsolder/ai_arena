@@ -2,11 +2,13 @@ import pytest
 import unittest.mock as mock
 import os
 import shutil
+import json
+import hashlib
 from pathlib import Path
 from backend.services.problem_ingestion import IOIIngestor
 from backend.database.models import Problem, Run
 from backend.orchestrator.engine import OrchestrationEngine
-import json
+from backend import config
 
 @pytest.fixture
 def mock_local_repo(tmp_path):
@@ -23,6 +25,35 @@ def mock_local_repo(tmp_path):
     tests_dir.mkdir()
     (tests_dir / "0.in").write_text("local in")
     (tests_dir / "0.out").write_text("local out")
+    
+    with mock.patch("backend.config.PROBLEMS_REPO_DIR", repo_dir):
+        yield repo_dir
+
+@pytest.fixture
+def mock_repo_with_symlink(tmp_path):
+    """Create a mock local problems repository with a symlink file."""
+    repo_dir = tmp_path / "problems_repo_symlink"
+    repo_dir.mkdir()
+    
+    # Create a problem directory
+    prob_dir = repo_dir / "symlink-prob"
+    prob_dir.mkdir()
+    (prob_dir / "statement.md").write_text("# Symlink Problem\nDescription here.")
+    
+    tests_dir = prob_dir / "tests"
+    tests_dir.mkdir()
+    
+    # Create target file INSIDE the problem directory (or subdir of it)
+    # So that relative path like "actual_test.in" or "./actual_test.in" works from tests_dir
+    (tests_dir / "actual_test.in").write_text("target input content")
+    
+    # Create a file that acts as a symlink (contains relative path)
+    # The relative path is "actual_test.in" (same directory)
+    link_file = tests_dir / "0.in"
+    link_file.write_text("actual_test.in")
+    
+    out_file = tests_dir / "0.out"
+    out_file.write_text("expected output")
     
     with mock.patch("backend.config.PROBLEMS_REPO_DIR", repo_dir):
         yield repo_dir
@@ -259,3 +290,73 @@ int main() {
     await db_session.refresh(solution)
     assert solution.tests_passed == 1
     assert solution.status == "completed"
+
+@pytest.mark.asyncio
+async def test_symlink_resolution(db_session, mock_repo_with_symlink):
+    """Test that IOIIngestor correctly resolves symlink-like files."""
+    ingestor = IOIIngestor(db_session)
+    
+    # The download_url will be "local://symlink-prob/tests/0.in"
+    download_url = "local://symlink-prob/tests/0.in"
+    
+    content = await ingestor.download_file(download_url)
+    assert content == b"target input content"
+
+@pytest.mark.asyncio
+async def test_sample_extraction(client, db_session, mock_local_repo):
+    """Test that sample_input and sample_output are extracted and saved to Problem model."""
+    repo_url = "https://github.com/any/repo/tree/main/local-prob"
+    
+    # Trigger ingestion
+    response = await client.post("/api/v1/problems/import/github", json={"url": repo_url})
+    assert response.status_code == 201
+    
+    problem_id = response.json()["id"]
+    
+    # Check database
+    problem = await db_session.get(Problem, problem_id)
+    assert problem.sample_input == "local in"
+    assert problem.sample_output == "local out"
+
+@pytest.mark.asyncio
+async def test_pdf_parsing_cache(client, db_session, tmp_path):
+    """Test that PDF parsing cache works as expected."""
+    # Create a mock PDF file in a local repo
+    repo_dir = tmp_path / "pdf_repo"
+    repo_dir.mkdir()
+    prob_dir = repo_dir / "pdf-prob"
+    prob_dir.mkdir()
+    
+    pdf_content = b"fake pdf content"
+    pdf_path = prob_dir / "statement.pdf"
+    pdf_path.write_bytes(pdf_content)
+    
+    # Mock pymupdf4llm.to_markdown and sync_tests (since this test is only about PDF parsing)
+    with mock.patch("backend.config.PROBLEMS_REPO_DIR", repo_dir), \
+         mock.patch("backend.config.PROBLEMS_DIR", tmp_path), \
+         mock.patch("pymupdf4llm.to_markdown", return_value="# Parsed Content") as mock_parse, \
+         mock.patch("backend.services.problem_ingestion.IOIIngestor.sync_tests", return_value=0) as mock_sync:
+        
+        ingestor = IOIIngestor(db_session)
+        repo_url = "https://github.com/any/repo/tree/main/pdf-prob"
+        
+        # 1. First ingestion - should call pymupdf4llm
+        problem1 = await ingestor.ingest_from_github(repo_url)
+        assert problem1.description_md == "# Parsed Content"
+        assert mock_parse.call_count == 1
+        
+        # Check if cache file exists
+        pdf_hash = hashlib.md5(pdf_content).hexdigest()
+        cache_file = tmp_path / ".cache" / "pdf_markdown" / f"{pdf_hash}.md"
+        assert cache_file.exists()
+        assert cache_file.read_text(encoding="utf-8") == "# Parsed Content"
+        
+        # 2. Second ingestion - should use cache
+        # We need to make sure it doesn't skip because it's "up to date"
+        # Force sync by setting last_synced_at to something old
+        problem1.last_synced_at = None
+        await db_session.commit()
+        
+        problem2 = await ingestor.ingest_from_github(repo_url, force_sync=True)
+        assert problem2.description_md == "# Parsed Content"
+        assert mock_parse.call_count == 1  # Should still be 1

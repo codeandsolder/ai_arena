@@ -16,6 +16,7 @@ dependencies = [
     "websockets>=12.0",
     "python-dotenv>=1.0.0",
     "pymupdf4llm",
+    "pymupdf-layout>=1.27.1",
 ]
 
 [project.optional-dependencies]

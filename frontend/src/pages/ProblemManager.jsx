@@ -1,17 +1,20 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plus, Edit2, Trash2, Upload, Eye, EyeOff, FileArchive, FileCode, Download, Github, RefreshCw, CheckCircle2, XCircle } from 'lucide-react';
+import { Plus, Edit2, Trash2, Upload, Eye, EyeOff, FileArchive, FileCode, Download, Github, RefreshCw, CheckCircle2, XCircle, FlaskConical, Clock, MemoryStick } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import toast from 'react-hot-toast';
 import {
   fetchProblems,
+  fetchProblem,
   createProblem,
   updateProblem,
   deleteProblem,
   uploadTests,
   fetchTests,
+  fetchTestFile,
   importProblems,
   importFromGithub,
-  syncTestsFromGithub
+  syncTestsFromGithub,
+  verifyExampleSolution,
 } from '../api';
 
 function ProblemManager() {
@@ -23,14 +26,18 @@ function ProblemManager() {
   const [selectedProblem, setSelectedProblem] = useState(null);
   const [tests, setTests] = useState([]);
   const [previewTest, setPreviewTest] = useState(null);
+  const [previewContent, setPreviewContent] = useState({ input: null, output: null });
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [verifyResult, setVerifyResult] = useState(null);
+  const [verifying, setVerifying] = useState(false);
 
   const [formData, setFormData] = useState({
     name: '',
     slug: '',
-    description: '',
+    description_md: '',
     time_limit_ms: 1000,
     memory_limit_mb: 256,
-    scoring_mode: 'standard',
+    scoring_mode: 'binary',
   });
 
   const [importData, setImportData] = useState({
@@ -62,6 +69,11 @@ function ProblemManager() {
       if (editingProblem) {
         await updateProblem(editingProblem.id, formData);
         toast.success('Problem updated');
+        // Refresh selected problem details if it's the one being edited
+        if (selectedProblem?.id === editingProblem.id) {
+          const updated = await fetchProblem(editingProblem.id);
+          setSelectedProblem(updated);
+        }
       } else {
         await createProblem(formData);
         toast.success('Problem created');
@@ -78,6 +90,12 @@ function ProblemManager() {
     try {
       await deleteProblem(id);
       toast.success('Problem deleted');
+      if (selectedProblem?.id === id) {
+        setSelectedProblem(null);
+        setTests([]);
+        setPreviewTest(null);
+        setPreviewContent({ input: null, output: null });
+      }
       loadProblems();
     } catch (error) {
       toast.error('Failed to delete problem: ' + error.message);
@@ -89,7 +107,8 @@ function ProblemManager() {
     setFormData({
       name: problem.name,
       slug: problem.slug,
-      description: problem.description || '',
+      // Bug fix: use description_md consistently (was 'description' before)
+      description_md: problem.description_md || '',
       time_limit_ms: problem.time_limit_ms,
       memory_limit_mb: problem.memory_limit_mb,
       scoring_mode: problem.scoring_mode,
@@ -102,10 +121,12 @@ function ProblemManager() {
     setFormData({
       name: '',
       slug: '',
-      description: '',
+      // Bug fix: use description_md consistently (was 'description' before)
+      description_md: '',
       time_limit_ms: 1000,
       memory_limit_mb: 256,
-      scoring_mode: 'standard',
+      // Bug fix: use valid scoring_mode value (was 'standard' before, backend expects binary|partial|custom)
+      scoring_mode: 'binary',
     });
     setShowForm(false);
   };
@@ -117,8 +138,6 @@ function ProblemManager() {
       const response = await importFromGithub(importData);
       toast.success(response.message || 'Import started');
       setShowImportForm(false);
-      // Since it's asynchronous, we might want to refresh after some time
-      // or just tell the user to refresh. For now, let's refresh once.
       setTimeout(loadProblems, 2000);
     } catch (error) {
       toast.error('Failed to start import: ' + error.message);
@@ -132,11 +151,11 @@ function ProblemManager() {
     try {
       const response = await syncTestsFromGithub(problemId);
       toast.success(response.message || 'Sync started');
-      // Refresh problem details to show updated state if possible
-      // or just wait for it to complete.
-      setTimeout(() => {
+      setTimeout(async () => {
         loadProblems();
         if (selectedProblem?.id === problemId) {
+          const updated = await fetchProblem(problemId);
+          setSelectedProblem(updated);
           loadTests(problemId);
         }
       }, 2000);
@@ -149,7 +168,6 @@ function ProblemManager() {
 
   const handleFileUpload = async (problemId, file) => {
     if (!file) return;
-    
     try {
       await uploadTests(problemId, file);
       toast.success('Tests uploaded successfully');
@@ -164,15 +182,76 @@ function ProblemManager() {
   const loadTests = async (problemId) => {
     try {
       const data = await fetchTests(problemId);
-      setTests(data);
+      // Bug fix: backend returns { problem_id, test_count, tests: [{filename, size_bytes}] }
+      // Normalize into a flat list with consistent shape for the UI
+      const normalized = (data.tests || []).map((t) => ({
+        id: t.filename,
+        name: t.filename,
+        size_bytes: t.size_bytes,
+      }));
+      setTests(normalized);
     } catch (error) {
       toast.error('Failed to load tests: ' + error.message);
     }
   };
 
+  // Bug fix: viewProblem now fetches full problem details (list endpoint omits description_md,
+  // source_url, tests_downloaded, etc.)
   const viewProblem = async (problem) => {
-    setSelectedProblem(problem);
-    await loadTests(problem.id);
+    try {
+      const full = await fetchProblem(problem.id);
+      setSelectedProblem(full);
+      setPreviewTest(null);
+      setPreviewContent({ input: null, output: null });
+      setVerifyResult(null);
+      await loadTests(problem.id);
+    } catch (error) {
+      toast.error('Failed to load problem details: ' + error.message);
+    }
+  };
+
+  // Bug fix: test preview fetches file content on demand via API instead of expecting
+  // inline content that the backend never returns
+  const handlePreviewTest = async (test) => {
+    if (previewTest?.id === test.id) {
+      setPreviewTest(null);
+      setPreviewContent({ input: null, output: null });
+      return;
+    }
+
+    setPreviewTest(test);
+    setPreviewContent({ input: null, output: null });
+
+    // Derive stem from filename (e.g. "001.in" -> "001")
+    const stem = test.name.replace(/\.(in|out)$/, '');
+    const inFile = stem + '.in';
+    const outFile = stem + '.out';
+
+    setPreviewLoading(true);
+    try {
+      const [inputRes, outputRes] = await Promise.all([
+        fetchTestFile(selectedProblem.id, inFile),
+        fetchTestFile(selectedProblem.id, outFile),
+      ]);
+      setPreviewContent({ input: inputRes, output: outputRes });
+    } catch (error) {
+      toast.error('Failed to load test preview: ' + error.message);
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const handleVerifyExample = async () => {
+    setVerifying(true);
+    setVerifyResult(null);
+    try {
+      const result = await verifyExampleSolution(selectedProblem.id);
+      setVerifyResult(result);
+    } catch (error) {
+      toast.error('Verification failed: ' + error.message);
+    } finally {
+      setVerifying(false);
+    }
   };
 
   const formatFileSize = (bytes) => {
@@ -297,9 +376,10 @@ function ProblemManager() {
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-300 mb-1">Description (Markdown)</label>
+              {/* Bug fix: was formData.description, now formData.description_md */}
               <textarea
-                value={formData.description}
-                onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+                value={formData.description_md}
+                onChange={(e) => setFormData({ ...formData, description_md: e.target.value })}
                 className="input-textarea"
                 rows={6}
                 placeholder="Problem description in Markdown..."
@@ -328,14 +408,15 @@ function ProblemManager() {
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-1">Scoring Mode</label>
+                {/* Bug fix: options now match backend enum (binary|partial|custom), was standard/icpc/ioi */}
                 <select
                   value={formData.scoring_mode}
                   onChange={(e) => setFormData({ ...formData, scoring_mode: e.target.value })}
                   className="input"
                 >
-                  <option value="standard">Standard</option>
-                  <option value="icpc">ICPC</option>
-                  <option value="ioi">IOI</option>
+                  <option value="binary">Binary</option>
+                  <option value="partial">Partial</option>
+                  <option value="custom">Custom</option>
                 </select>
               </div>
             </div>
@@ -381,7 +462,17 @@ function ProblemManager() {
                     </div>
                     <div className="flex items-center space-x-1">
                       <button
-                        onClick={(e) => { e.stopPropagation(); handleEdit(problem); }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          // handleEdit needs the full problem; fetch it if we're editing from list
+                          if (selectedProblem?.id === problem.id) {
+                            handleEdit(selectedProblem);
+                          } else {
+                            fetchProblem(problem.id).then(handleEdit).catch((err) =>
+                              toast.error('Failed to load problem: ' + err.message)
+                            );
+                          }
+                        }}
                         className="p-2 text-gray-400 hover:bg-gray-700 rounded-lg"
                       >
                         <Edit2 className="h-4 w-4" />
@@ -403,13 +494,26 @@ function ProblemManager() {
         {/* Problem Details */}
         {selectedProblem && (
           <div className="space-y-4">
-            <h2 className="text-lg font-semibold">Problem Details</h2>
-            
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold">Problem Details</h2>
+              {selectedProblem.tests_downloaded && (
+                <button
+                  onClick={handleVerifyExample}
+                  disabled={verifying}
+                  className="btn-secondary flex items-center space-x-2 text-sm py-1.5"
+                >
+                  <FlaskConical className={`h-4 w-4 ${verifying ? 'animate-pulse text-blue-400' : ''}`} />
+                  <span>{verifying ? 'Verifying...' : 'Verify Example Solution'}</span>
+                </button>
+              )}
+            </div>
+
             {/* Description */}
             <div className="card">
               <h3 className="font-medium mb-2">Description</h3>
               <div className="prose prose-invert prose-sm max-w-none max-h-64 overflow-y-auto">
-                <ReactMarkdown>{selectedProblem.description || 'No description'}</ReactMarkdown>
+                {/* Bug fix: was selectedProblem.description (undefined); now description_md from full fetch */}
+                <ReactMarkdown>{selectedProblem.description_md || 'No description'}</ReactMarkdown>
               </div>
             </div>
 
@@ -435,7 +539,7 @@ function ProblemManager() {
                     )}
                   </div>
                 </div>
-                
+
                 <p className="text-xs text-gray-400 mb-4 truncate" title={selectedProblem.source_url}>
                   {selectedProblem.source_url}
                 </p>
@@ -484,12 +588,12 @@ function ProblemManager() {
               {/* Test List */}
               {tests.length > 0 && (
                 <div className="mt-4">
-                  <p className="text-sm text-gray-400 mb-2">{tests.length} test(s)</p>
+                  <p className="text-sm text-gray-400 mb-2">{tests.length} file(s)</p>
                   <div className="space-y-1 max-h-64 overflow-y-auto">
                     {tests.map((test) => (
                       <button
                         key={test.id}
-                        onClick={() => setPreviewTest(previewTest?.id === test.id ? null : test)}
+                        onClick={() => handlePreviewTest(test)}
                         className="w-full flex items-center justify-between p-2 bg-gray-800 hover:bg-gray-750 rounded text-left"
                       >
                         <div className="flex items-center space-x-2">
@@ -497,8 +601,7 @@ function ProblemManager() {
                           <span className="text-sm font-mono">{test.name}</span>
                         </div>
                         <div className="flex items-center space-x-2 text-xs text-gray-500">
-                          <span>{formatFileSize(test.input_size)}</span>
-                          <span>{formatFileSize(test.output_size)}</span>
+                          <span>{formatFileSize(test.size_bytes)}</span>
                           {previewTest?.id === test.id ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
                         </div>
                       </button>
@@ -508,24 +611,120 @@ function ProblemManager() {
               )}
             </div>
 
+            {/* Verify Example Result */}
+            {verifyResult && (
+              <div className={`card border ${verifyResult.all_passed ? 'border-green-500/30' : 'border-red-500/30'}`}>
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="font-medium flex items-center space-x-2">
+                    <FlaskConical className="h-4 w-4" />
+                    <span>Example Solution Verification</span>
+                  </h3>
+                  <button
+                    onClick={() => setVerifyResult(null)}
+                    className="text-gray-500 hover:text-gray-300 text-xs"
+                  >
+                    <XCircle className="h-4 w-4" />
+                  </button>
+                </div>
+
+                <p className="text-xs text-gray-500 font-mono mb-3 truncate" title={verifyResult.solution_file}>
+                  {verifyResult.solution_file}
+                </p>
+
+                {!verifyResult.compile_success ? (
+                  <div>
+                    <div className="flex items-center space-x-2 text-red-400 mb-2">
+                      <XCircle className="h-4 w-4" />
+                      <span className="text-sm font-medium">Compilation Failed</span>
+                    </div>
+                    <pre className="bg-gray-950 p-3 rounded text-xs font-mono text-red-300 overflow-x-auto max-h-40 whitespace-pre-wrap">
+                      {verifyResult.compile_log}
+                    </pre>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {/* Summary row */}
+                    <div className="flex items-center space-x-4">
+                      <div className={`flex items-center space-x-1.5 text-sm font-medium ${verifyResult.all_passed ? 'text-green-400' : 'text-red-400'}`}>
+                        {verifyResult.all_passed
+                          ? <CheckCircle2 className="h-4 w-4" />
+                          : <XCircle className="h-4 w-4" />}
+                        <span>{verifyResult.tests_passed}/{verifyResult.tests_total} tests passed</span>
+                      </div>
+                      {verifyResult.avg_time_ms != null && (
+                        <div className="flex items-center space-x-1 text-xs text-gray-400">
+                          <Clock className="h-3 w-3" />
+                          <span>avg {verifyResult.avg_time_ms.toFixed(1)}ms</span>
+                        </div>
+                      )}
+                      {verifyResult.max_time_ms != null && (
+                        <div className="flex items-center space-x-1 text-xs text-gray-400">
+                          <Clock className="h-3 w-3" />
+                          <span>max {verifyResult.max_time_ms.toFixed(1)}ms</span>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Per-test breakdown */}
+                    {verifyResult.test_results.length > 0 && (
+                      <div className="max-h-48 overflow-y-auto space-y-1">
+                        {verifyResult.test_results.map((t) => (
+                          <div
+                            key={t.test_index}
+                            className={`flex items-center justify-between px-2 py-1 rounded text-xs ${
+                              t.passed ? 'bg-green-900/20 text-green-300' : 'bg-red-900/20 text-red-300'
+                            }`}
+                          >
+                            <div className="flex items-center space-x-2">
+                              {t.passed
+                                ? <CheckCircle2 className="h-3 w-3 text-green-400 shrink-0" />
+                                : <XCircle className="h-3 w-3 text-red-400 shrink-0" />}
+                              <span className="font-mono">test {t.test_index}</span>
+                              <span className={`px-1.5 py-0.5 rounded text-xs font-mono ${
+                                t.verdict === 'AC' ? 'bg-green-800/40' :
+                                t.verdict === 'TLE' ? 'bg-yellow-800/40 text-yellow-300' :
+                                'bg-red-800/40'
+                              }`}>{t.verdict}</span>
+                            </div>
+                            <div className="flex items-center space-x-3 text-gray-400">
+                              {t.time_ms != null && <span>{t.time_ms.toFixed(1)}ms</span>}
+                              {t.memory_kb != null && <span>{(t.memory_kb / 1024).toFixed(1)}MB</span>}
+                              {t.error && <span className="text-red-400 truncate max-w-32" title={t.error}>{t.error}</span>}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Test Preview */}
+            {/* Bug fix: content is now loaded on demand via fetchTestFile, not expected inline */}
             {previewTest && (
               <div className="card">
-                <h3 className="font-medium mb-3">Test Preview: {previewTest.name}</h3>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <p className="text-xs text-gray-400 mb-1">Input:</p>
-                    <pre className="bg-gray-950 p-3 rounded text-xs font-mono text-gray-300 overflow-x-auto max-h-48">
-                      {previewTest.input_content || 'N/A'}
-                    </pre>
+                <h3 className="font-medium mb-3">
+                  Test Preview: {previewTest.name.replace(/\.(in|out)$/, '')}
+                </h3>
+                {previewLoading ? (
+                  <div className="text-center py-4 text-gray-400 text-sm">Loading...</div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <p className="text-xs text-gray-400 mb-1">Input:</p>
+                      <pre className="bg-gray-950 p-3 rounded text-xs font-mono text-gray-300 overflow-x-auto max-h-48">
+                        {previewContent.input ?? 'N/A'}
+                      </pre>
+                    </div>
+                    <div>
+                      <p className="text-xs text-gray-400 mb-1">Expected Output:</p>
+                      <pre className="bg-gray-950 p-3 rounded text-xs font-mono text-gray-300 overflow-x-auto max-h-48">
+                        {previewContent.output ?? 'N/A'}
+                      </pre>
+                    </div>
                   </div>
-                  <div>
-                    <p className="text-xs text-gray-400 mb-1">Expected Output:</p>
-                    <pre className="bg-gray-950 p-3 rounded text-xs font-mono text-gray-300 overflow-x-auto max-h-48">
-                      {previewTest.output_content || 'N/A'}
-                    </pre>
-                  </div>
-                </div>
+                )}
               </div>
             )}
           </div>

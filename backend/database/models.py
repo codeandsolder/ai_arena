@@ -37,8 +37,11 @@ class Problem(Base):
     time_limit_ms = Column(Integer, default=2000, nullable=False)
     memory_limit_mb = Column(Integer, default=256, nullable=False)
     test_count = Column(Integer, default=0, nullable=False)
+    sample_input = Column(Text, nullable=True)
+    sample_output = Column(Text, nullable=True)
     scoring_mode = Column(String, default="binary", nullable=False)
     source_url = Column(String, nullable=True)
+    last_synced_at = Column(DateTime, nullable=True)
     tests_downloaded = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)
 

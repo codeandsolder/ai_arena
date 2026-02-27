@@ -75,6 +75,20 @@ export const uploadTests = (id, zipFile) => {
 
 export const fetchTests = (id) => apiRequest(`/problems/${id}/tests`);
 
+export const verifyExampleSolution = (id) => apiRequest(`/problems/${id}/verify-example`, {
+  method: 'POST',
+});
+
+export const fetchTestFile = (problemId, filename) => {
+  return fetch(`${BASE_URL}/problems/${problemId}/tests/${filename}`).then(async (res) => {
+    if (!res.ok) {
+      const errorText = await res.text();
+      throw new Error(`HTTP ${res.status}: ${errorText || 'Failed to fetch test file'}`);
+    }
+    return res.text();
+  });
+};
+
 // Run API
 export const fetchRuns = () => apiRequest('/runs/');
 
@@ -170,6 +184,8 @@ export default {
   deleteProblem,
   uploadTests,
   fetchTests,
+  fetchTestFile,
+  verifyExampleSolution,
   // Runs
   fetchRuns,
   fetchRun,
