@@ -502,13 +502,13 @@ async def compile_and_benchmark(
         # Build compilation command
         cmd_parts = [validated_compiler, "/workspace/solution.cpp", "-o", "/workspace/solution"]
         cmd_parts.extend(validated_flags)
-        cmd_str = " ".join(cmd_parts)
         
-        logger.info(f"Compiling solution {solution_id} with command: {cmd_str}")
+        logger.info(f"Compiling solution {solution_id} with command: {' '.join(cmd_parts)}")
         
         # Run compilation in container
+        # Execute directly instead of via sh -c to prevent shell injection
         compile_result = await container_manager.execute_command(
-            command=["sh", "-c", cmd_str],
+            command=cmd_parts,
             volumes={
                 source_path: {"bind": "/workspace/solution.cpp", "mode": "ro"},
                 temp_dir: {"bind": "/workspace", "mode": "rw"}

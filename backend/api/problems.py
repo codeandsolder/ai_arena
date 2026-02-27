@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +26,12 @@ router = APIRouter(prefix="/problems", tags=["problems"])
 # =============================================================================
 # Pydantic Schemas
 # =============================================================================
+
+
+class ProblemImportRequest(BaseModel):
+    """Schema for importing problems from APPS dataset."""
+    start_id: int = Field(..., ge=0, description="Starting APPS problem ID")
+    end_id: int = Field(..., ge=0, description="Ending APPS problem ID")
 
 
 class ProblemBase(BaseModel):
@@ -426,3 +432,41 @@ async def delete_problem(problem_id: int, db: AsyncSession = Depends(get_db)):
     await db.commit()
     
     return None
+
+
+@router.post("/import", status_code=status.HTTP_202_ACCEPTED)
+async def import_problems(
+    import_data: ProblemImportRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Import problems from the APPS dataset asynchronously.
+    
+    Args:
+        import_data: IDs range to import
+        background_tasks: FastAPI background tasks
+        
+    Returns:
+        Status message
+    """
+    if import_data.end_id < import_data.start_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="end_id must be greater than or equal to start_id"
+        )
+    
+    # Calculate count for ingest_batch
+    count = import_data.end_id - import_data.start_id + 1
+    
+    # Limit count to prevent excessive resource usage in one go
+    if count > 100:
+         raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Maximum 100 problems can be imported at once"
+        )
+
+    from backend.services.problem_ingestion import ingest_batch
+    
+    background_tasks.add_task(ingest_batch, import_data.start_id, count)
+    
+    return {"message": f"Import of {count} problems started in the background"}

@@ -32,6 +32,11 @@ async function apiRequest(endpoint, options = {}) {
 // Problem API
 export const fetchProblems = () => apiRequest('/problems/');
 
+export const importProblems = (data) => apiRequest('/problems/import', {
+  method: 'POST',
+  body: data,
+});
+
 export const fetchProblem = (id) => apiRequest(`/problems/${id}`);
 
 export const createProblem = (data) => apiRequest('/problems/', {
@@ -148,6 +153,7 @@ export default {
   // Problems
   fetchProblems,
   fetchProblem,
+  importProblems,
   createProblem,
   updateProblem,
   deleteProblem,

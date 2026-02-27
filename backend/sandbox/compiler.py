@@ -156,8 +156,8 @@ def validate_flags(flags: List[str]) -> List[str]:
             # Validate macro name and optional value
             # Format: NAME or NAME=value
             # Allow alphanumeric, underscores, dots, commas, hex (0x), and basic operators
-            # Block shell injection chars: ; | & $ ` < > ( )
-            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*(?:=[^;|&$`<>()]*)?$', macro_def):
+            # Block shell injection and whitespace chars: ; | & $ ` < > ( ) \s
+            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*(?:=[^;|&$`<>()\s]*)?$', macro_def):
                 validated_flags.append(flag)
                 continue
             
@@ -342,13 +342,13 @@ async def compile_in_container(
         # Build compilation command
         cmd_parts = [validated_compiler, "/workspace/solution.cpp", "-o", output_binary]
         cmd_parts.extend(validated_flags)
-        cmd = " ".join(cmd_parts)
         
-        logger.info(f"Compiling in container with command: {cmd}")
+        logger.info(f"Compiling in container with command: {' '.join(cmd_parts)}")
         
         # Run compilation in container
+        # Execute directly instead of via sh -c to prevent shell injection
         success, stdout, stderr = await container_runner(
-            ["sh", "-c", cmd],
+            cmd_parts,
             timeout=timeout,
             volumes={
                 source_path: {"bind": "/workspace/solution.cpp", "mode": "ro"}

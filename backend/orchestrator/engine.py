@@ -840,6 +840,45 @@ class OrchestrationEngine:
                 )
                 db_session.add(api_call)
                 
+                # Security Analysis for retried solution
+                try:
+                    security_result = await self.security_analyzer.analyze_solution(
+                        source_code=solution.source_code or "",
+                        compiler_flags=solution.compiler_flags or "",
+                        run_id=run_id,
+                        solution_id=solution.id
+                    )
+                    
+                    # Log security API calls
+                    for sec_response in security_result.model_responses:
+                        sec_api_call = ApiCall(
+                            run_id=run_id,
+                            round_id=round_id,
+                            solution_id=solution.id,
+                            purpose="security_check_retry",
+                            model_slug="security_auditor",
+                            prompt_text="[Security Analysis Prompt]",
+                            thinking_text=sec_response.thinking_text,
+                            response_text=sec_response.response_text,
+                            input_tokens=sec_response.input_tokens,
+                            output_tokens=sec_response.output_tokens,
+                            thinking_tokens=sec_response.thinking_tokens,
+                            cost_usd=sec_response.cost_usd,
+                            latency_ms=sec_response.latency_ms
+                        )
+                        db_session.add(sec_api_call)
+
+                    if not security_result.is_safe:
+                        solution.status = "security_failed"
+                        solution.error_message = f"Security Check Failed (on retry):\n{security_result.details}"
+                        logger.warning(f"Retried solution {solution.id} failed security check")
+                        return None
+                except Exception as e:
+                    logger.error(f"Security analysis error on retry for solution {solution.id}: {e}")
+                    solution.status = "security_error"
+                    solution.error_message = f"Security analysis failed on retry: {e}"
+                    return None
+
                 # Retry compilation
                 import shlex
                 try:
@@ -847,11 +886,13 @@ class OrchestrationEngine:
                 except ValueError:
                     flags_list = ["-O2", "-std=c++20"]
                 
+                # Skip safety check as we just did it with SecurityAnalyzer
                 success, stdout, stderr, output_path = await compile_solution(
                     source_code=solution.source_code,
                     compiler=solution.compiler or "g++-14",
                     flags=flags_list,
-                    output_path=binary_path
+                    output_path=binary_path,
+                    skip_safety_check=True
                 )
                 
                 solution.compile_success = success

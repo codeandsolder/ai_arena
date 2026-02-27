@@ -1,14 +1,15 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plus, Edit2, Trash2, Upload, Eye, EyeOff, FileArchive, FileCode } from 'lucide-react';
+import { Plus, Edit2, Trash2, Upload, Eye, EyeOff, FileArchive, FileCode, Download } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import toast from 'react-hot-toast';
-import { fetchProblems, createProblem, updateProblem, deleteProblem, uploadTests, fetchTests } from '../api';
+import { fetchProblems, createProblem, updateProblem, deleteProblem, uploadTests, fetchTests, importProblems } from '../api';
 
 function ProblemManager() {
   const [problems, setProblems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [editingProblem, setEditingProblem] = useState(null);
   const [showForm, setShowForm] = useState(false);
+  const [showImportForm, setShowImportForm] = useState(false);
   const [selectedProblem, setSelectedProblem] = useState(null);
   const [tests, setTests] = useState([]);
   const [previewTest, setPreviewTest] = useState(null);
@@ -21,6 +22,13 @@ function ProblemManager() {
     memory_limit_mb: 256,
     scoring_mode: 'standard',
   });
+
+  const [importData, setImportData] = useState({
+    start_id: 0,
+    end_id: 0,
+  });
+
+  const [importing, setImporting] = useState(false);
 
   const loadProblems = useCallback(async () => {
     try {
@@ -91,6 +99,23 @@ function ProblemManager() {
     setShowForm(false);
   };
 
+  const handleImport = async (e) => {
+    e.preventDefault();
+    setImporting(true);
+    try {
+      const response = await importProblems(importData);
+      toast.success(response.message);
+      setShowImportForm(false);
+      // Since it's asynchronous, we might want to refresh after some time
+      // or just tell the user to refresh. For now, let's refresh once.
+      setTimeout(loadProblems, 2000);
+    } catch (error) {
+      toast.error('Failed to start import: ' + error.message);
+    } finally {
+      setImporting(false);
+    }
+  };
+
   const handleFileUpload = async (problemId, file) => {
     if (!file) return;
     
@@ -138,14 +163,77 @@ function ProblemManager() {
           <h1 className="text-2xl font-bold">Problem Manager</h1>
           <p className="text-gray-400 mt-1">Manage competitive programming problems</p>
         </div>
-        <button
-          onClick={() => setShowForm(!showForm)}
-          className="btn-primary flex items-center space-x-2"
-        >
-          {showForm ? <EyeOff className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
-          <span>{showForm ? 'Cancel' : 'New Problem'}</span>
-        </button>
+        <div className="flex space-x-2">
+          <button
+            onClick={() => {
+              setShowImportForm(!showImportForm);
+              setShowForm(false);
+            }}
+            className="btn-secondary flex items-center space-x-2"
+          >
+            {showImportForm ? <EyeOff className="h-4 w-4" /> : <Download className="h-4 w-4" />}
+            <span>{showImportForm ? 'Cancel' : 'Import from APPS'}</span>
+          </button>
+          <button
+            onClick={() => {
+              setShowForm(!showForm);
+              setShowImportForm(false);
+            }}
+            className="btn-primary flex items-center space-x-2"
+          >
+            {showForm ? <EyeOff className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+            <span>{showForm ? 'Cancel' : 'New Problem'}</span>
+          </button>
+        </div>
       </div>
+
+      {/* Import Form */}
+      {showImportForm && (
+        <div className="card border-blue-500/30">
+          <h2 className="text-lg font-semibold mb-4 flex items-center">
+            <Download className="h-5 w-5 mr-2 text-blue-400" />
+            Import Problems from APPS Dataset
+          </h2>
+          <form onSubmit={handleImport} className="space-y-4">
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1">Start ID</label>
+                <input
+                  type="number"
+                  value={importData.start_id}
+                  onChange={(e) => setImportData({ ...importData, start_id: parseInt(e.target.value) })}
+                  className="input"
+                  min="0"
+                  required
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1">End ID</label>
+                <input
+                  type="number"
+                  value={importData.end_id}
+                  onChange={(e) => setImportData({ ...importData, end_id: parseInt(e.target.value) })}
+                  className="input"
+                  min="0"
+                  required
+                />
+              </div>
+            </div>
+            <p className="text-xs text-gray-400">
+              Problems will be downloaded asynchronously from the APPS GitHub repository.
+              This may take a few moments per problem. Maximum 100 problems per batch.
+            </p>
+            <div className="flex space-x-3">
+              <button type="submit" className="btn-primary" disabled={importing}>
+                {importing ? 'Starting Import...' : 'Start Import'}
+              </button>
+              <button type="button" onClick={() => setShowImportForm(false)} className="btn-secondary">
+                Cancel
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {/* Form */}
       {showForm && (

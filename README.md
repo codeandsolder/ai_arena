@@ -25,6 +25,15 @@ A full-stack platform for competitive AI programming optimization. Models compet
 
 ## Quick Start
 
+### 🚀 One-Click Startup (Windows)
+
+If you have already performed the initial setup (cloning, installing dependencies), you can start the entire project using the provided shortcut:
+
+1. Double-click `start.bat` in the project root.
+2. The script will automatically start the backend, the frontend, and open your browser to the dashboard.
+
+---
+
 ### 1. Clone and Setup
 
 ```bash
