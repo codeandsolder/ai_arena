@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.orchestrator.model_client import ModelClient, ModelResponse
 from backend.orchestrator.prompts import PromptFormatter
 from backend.orchestrator.summarizer import Summarizer
+from backend.orchestrator.security import SecurityAnalyzer
 from backend.database.models import Run, Round, Solution, ApiCall, Problem, TestResult
 from backend.database.session import get_session_maker
 from backend.sandbox.compiler import compile_solution
@@ -48,6 +49,7 @@ class RunConfig:
     allow_error_retry: bool = True
     max_error_retries: int = 2
     judge_model: str = "anthropic/claude-3.5-sonnet"
+    security_models: List[str] = field(default_factory=lambda: ["anthropic/claude-3-haiku"])
 
 
 @dataclass
@@ -105,6 +107,7 @@ class OrchestrationEngine:
         self.summarizer = summarizer
         self.prompt_formatter = PromptFormatter()
         self.websocket_manager = websocket_manager or get_websocket_manager()
+        self.security_analyzer = SecurityAnalyzer(self.model_client)
         
         # Track paused runs
         self._paused_runs: set = set()
@@ -625,12 +628,71 @@ class OrchestrationEngine:
         run_dir = RUNS_DIR / str(run_id) / f"round_{round_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
         
+        # Update security analyzer models if specified
+        if config.security_models:
+            self.security_analyzer.security_models = config.security_models
+
         compiled = []
         
         async def compile_with_retry(solution: Solution) -> Tuple[Solution, Optional[str]]:
             """Compile a solution with optional retry on error."""
             binary_path = str(run_dir / f"solution_{solution.id}")
             
+            await self.websocket_manager.broadcast_solution_status(
+                run_id=run_id,
+                solution_id=solution.id,
+                model=solution.model_slug,
+                status="analyzing_security"
+            )
+
+            # Security Analysis
+            try:
+                security_result = await self.security_analyzer.analyze_solution(
+                    source_code=solution.source_code or "",
+                    compiler_flags=solution.compiler_flags or "",
+                    run_id=run_id,
+                    solution_id=solution.id
+                )
+
+                # Log API calls
+                for response in security_result.model_responses:
+                    api_call = ApiCall(
+                        run_id=run_id,
+                        round_id=round_id,
+                        solution_id=solution.id,
+                        purpose="security_check",
+                        model_slug="security_auditor",
+                        prompt_text="[Security Analysis Prompt]",
+                        thinking_text=response.thinking_text,
+                        response_text=response.response_text,
+                        input_tokens=response.input_tokens,
+                        output_tokens=response.output_tokens,
+                        thinking_tokens=response.thinking_tokens,
+                        cost_usd=response.cost_usd,
+                        latency_ms=response.latency_ms
+                    )
+                    db_session.add(api_call)
+                
+                if not security_result.is_safe:
+                    solution.status = "security_failed"
+                    solution.error_message = f"Security Check Failed:\n{security_result.details}"
+                    logger.warning(f"Solution {solution.id} failed security check: {security_result.details}")
+                    
+                    await self.websocket_manager.broadcast_solution_status(
+                        run_id=run_id,
+                        solution_id=solution.id,
+                        model=solution.model_slug,
+                        status="security_failed"
+                    )
+                    return solution, None
+
+            except Exception as e:
+                logger.error(f"Security analysis error for solution {solution.id}: {e}")
+                # Fail safe? Or allow retry? Let's fail safe.
+                solution.status = "security_error"
+                solution.error_message = f"Security analysis failed: {e}"
+                return solution, None
+
             await self.websocket_manager.broadcast_solution_status(
                 run_id=run_id,
                 solution_id=solution.id,
@@ -645,12 +707,14 @@ class OrchestrationEngine:
             except ValueError:
                 flags_list = ["-O2", "-std=c++20"]
             
-            # Try compilation
+            # Try compilation (skip_safety_check=True because we just did it)
+            # Note: I need to update compile_solution to accept skip_safety_check
             success, stdout, stderr, output_path = await compile_solution(
                 source_code=solution.source_code or "",
                 compiler=solution.compiler or "g++-14",
                 flags=flags_list,
-                output_path=binary_path
+                output_path=binary_path,
+                skip_safety_check=True
             )
             
             # Update solution
@@ -1003,7 +1067,8 @@ class OrchestrationEngine:
             penalty_wrong_answer=data.get("penalty_wrong_answer", -0.5),
             allow_error_retry=data.get("allow_error_retry", True),
             max_error_retries=data.get("max_error_retries", 2),
-            judge_model=data.get("judge_model", "anthropic/claude-3.5-sonnet")
+            judge_model=data.get("judge_model", "anthropic/claude-3.5-sonnet"),
+            security_models=data.get("security_models", ["anthropic/claude-3-haiku"])
         )
     
     async def _update_run_status(

@@ -20,6 +20,30 @@ JUDGE_SYSTEM_PROMPT = """\
 You are judging a code optimization competition. Analyze the submitted solutions and produce a concise, informative summary that will help competitors improve in the next round.
 """
 
+SECURITY_SYSTEM_PROMPT = """\
+You are an expert security auditor for C++ code running in a competitive programming sandbox.
+Your job is to analyze code and compiler flags for malicious intent, security bypasses, or dangerous patterns.
+
+You must ignore standard competitive programming patterns (like infinite loops or memory usage) unless they are clearly malicious attacks (like fork bombs).
+Focus on:
+1. System calls (exec, system, etc.)
+2. Network access (socket, connect, etc.)
+3. File system access outside standard I/O (opening random files, /etc/passwd, etc.)
+4. Dangerous compiler flags (macro injection, linker flags, plugin loading)
+5. Inline assembly that might try to bypass sandbox
+6. Preprocessor abuse to hide malicious code
+
+Respond with a JSON object in this exact format:
+```json
+{
+  "safe": true,
+  "risk_level": "LOW",
+  "reason": "Code uses standard algorithms and safe flags."
+}
+```
+"safe" should be false if risk_level is HIGH or MEDIUM.
+"""
+
 
 # =============================================================================
 # Response Format Template
@@ -145,6 +169,20 @@ Please carefully fix the error and submit a corrected solution. Ensure:
 - Edge cases are properly handled
 """
 
+SECURITY_USER_TEMPLATE = """\
+Analyze the following C++ code and compiler flags for security risks.
+
+## Compiler Flags
+{flags}
+
+## Source Code
+```cpp
+{code}
+```
+
+Is this submission safe to compile and run in a sandboxed environment?
+"""
+
 
 # =============================================================================
 # PromptFormatter Class
@@ -168,6 +206,11 @@ class PromptFormatter:
     def get_judge_system_prompt() -> str:
         """Get the system prompt for the judge model."""
         return JUDGE_SYSTEM_PROMPT
+
+    @staticmethod
+    def get_security_system_prompt() -> str:
+        """Get the system prompt for the security auditor."""
+        return SECURITY_SYSTEM_PROMPT
     
     @staticmethod
     def get_response_format() -> str:
@@ -272,6 +315,26 @@ class PromptFormatter:
             response_format=RESPONSE_FORMAT
         )
     
+    @staticmethod
+    def format_security_user_prompt(
+        code: str,
+        flags: str
+    ) -> str:
+        """
+        Format the security analysis user prompt.
+        
+        Args:
+            code: The source code to analyze
+            flags: The compiler flags to analyze
+            
+        Returns:
+            Formatted security prompt string
+        """
+        return SECURITY_USER_TEMPLATE.format(
+            code=code,
+            flags=flags
+        )
+
     @staticmethod
     def format_round_results(
         solutions_data: list,

@@ -149,9 +149,17 @@ def validate_flags(flags: List[str]) -> List[str]:
         
         # Check for flags with values (e.g., -DFOO, -I/path)
         # Allow -D definitions (macro definitions) as they're generally safe
-        if flag.startswith("-D") and not any(c in flag for c in ";|&$`"):
-            validated_flags.append(flag)
-            continue
+        # Only allow alphanumeric characters and underscores in macro name and value
+        if flag.startswith("-D"):
+            # Extract macro definition part (everything after -D)
+            macro_def = flag[2:]
+            # Validate macro name and optional value
+            # Format: NAME or NAME=value
+            # Allow alphanumeric, underscores, dots, commas, hex (0x), and basic operators
+            # Block shell injection chars: ; | & $ ` < > ( )
+            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*(?:=[^;|&$`<>()]*)?$', macro_def):
+                validated_flags.append(flag)
+                continue
             
         # Log warning for non-whitelisted flag
         logger.warning(f"Flag '{flag}' is not in whitelist and will be removed")
@@ -185,7 +193,8 @@ async def compile_solution(
     compiler: str,
     flags: List[str],
     output_path: str,
-    timeout: int = 60
+    timeout: int = 60,
+    skip_safety_check: bool = False
 ) -> Tuple[bool, str, str, Optional[str]]:
     """
     Compile a C++ solution with security checks.
@@ -196,6 +205,7 @@ async def compile_solution(
         flags: List of compiler flags
         output_path: Path where the compiled binary should be written
         timeout: Compilation timeout in seconds (default: 60)
+        skip_safety_check: If True, skip the static safety check (e.g., if AI analysis already done)
         
     Returns:
         Tuple of (success, stdout, stderr, output_binary_path or None)
@@ -206,15 +216,20 @@ async def compile_solution(
     # Validate flags
     validated_flags = validate_flags(flags)
     
-    # Perform safety check
-    violations = perform_safety_check(source_code)
-    if violations:
-        error_msg = "Source code failed safety check:\n" + "\n".join(violations)
-        logger.error(error_msg)
-        return False, "", error_msg, None
+    # Perform safety check (unless skipped)
+    if not skip_safety_check:
+        violations = perform_safety_check(source_code)
+        if violations:
+            error_msg = "Source code failed safety check:\n" + "\n".join(violations)
+            logger.error(error_msg)
+            return False, "", error_msg, None
     
     # Create temporary directory for compilation
     with tempfile.TemporaryDirectory() as temp_dir:
+        # Force output_path to be within temp_dir to prevent directory traversal
+        output_filename = Path(output_path).name
+        safe_output_path = str(Path(temp_dir) / output_filename)
+        
         # Write source code to temporary file
         source_path = Path(temp_dir) / "solution.cpp"
         try:
@@ -228,7 +243,7 @@ async def compile_solution(
         cmd = [
             validated_compiler,
             str(source_path),
-            "-o", output_path,
+            "-o", safe_output_path,
         ] + validated_flags
         
         logger.info(f"Compiling with command: {' '.join(cmd)}")
@@ -258,8 +273,19 @@ async def compile_solution(
             
             if process.returncode == 0:
                 # Compilation successful
-                logger.info(f"Compilation successful: {output_path}")
-                return True, stdout_str, stderr_str, output_path
+                # Copy binary from temp to output_path before returning
+                # (output_path is the intended persistent location)
+                try:
+                    # Ensure destination directory exists
+                    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                    # Copy binary to the requested output path
+                    with open(safe_output_path, 'rb') as src, open(output_path, 'wb') as dst:
+                        dst.write(src.read())
+                    logger.info(f"Compilation successful: {output_path}")
+                    return True, stdout_str, stderr_str, output_path
+                except Exception as e:
+                    logger.error(f"Failed to copy binary to {output_path}: {e}")
+                    return False, stdout_str, f"Failed to copy binary: {e}", None
             else:
                 # Compilation failed
                 error_msg = f"Compilation failed with exit code {process.returncode}"

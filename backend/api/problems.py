@@ -318,8 +318,21 @@ async def upload_test_cases(
             content = await file.read()
             f.write(content)
         
-        # Extract ZIP
+        # Extract ZIP with path traversal validation (Zip Slip fix)
         with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
+            for member in zip_ref.namelist():
+                member_path = tests_dir / member
+                # Resolve the path and verify it's still within tests_dir
+                resolved_path = member_path.resolve()
+                tests_dir_resolved = tests_dir.resolve()
+                
+                if not str(resolved_path).startswith(str(tests_dir_resolved)):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Path traversal attempt detected in ZIP file"
+                    )
+            
+            # All members are safe, now extract
             zip_ref.extractall(tests_dir)
         
         # Remove the zip file after extraction
