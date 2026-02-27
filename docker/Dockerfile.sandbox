@@ -20,8 +20,7 @@ RUN apt-get update && apt-get install -y \
 # Add LLVM repository for clang versions
 RUN wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc \
     && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-18 main" \
-    && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-17 main" \
-    && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-16 main"
+    && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-17 main"
 
 # Install GCC versions (12, 13, 14)
 RUN apt-get update && apt-get install -y \
@@ -33,9 +32,8 @@ RUN apt-get update && apt-get install -y \
     g++-14 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Clang versions (16, 17, 18)
+# Install Clang versions (17, 18)
 RUN apt-get update && apt-get install -y \
-    clang-16 \
     clang-17 \
     clang-18 \
     && rm -rf /var/lib/apt/lists/*

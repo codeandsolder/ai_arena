@@ -167,21 +167,8 @@ class Summarizer:
             Approach explanation or default message
         """
         # Look for the API call that generated this solution
-        if hasattr(solution, 'api_calls') and solution.api_calls:
-            for api_call in solution.api_calls:
-                if api_call.purpose == "solution_generation":
-                    try:
-                        # Parse the response to get explanation
-                        response_text = api_call.response_text or ""
-                        json_start = response_text.find("{")
-                        json_end = response_text.rfind("}")
-                        
-                        if json_start != -1 and json_end != -1:
-                            json_str = response_text[json_start:json_end + 1]
-                            data = json.loads(json_str)
-                            return data.get("explanation", "No explanation provided")
-                    except json.JSONDecodeError:
-                        continue
+        # In async mode, we cannot safely access relationships like api_calls lazily
+        return "No explanation provided"
         
         return "No explanation available"
     

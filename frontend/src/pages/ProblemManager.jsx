@@ -1,8 +1,18 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plus, Edit2, Trash2, Upload, Eye, EyeOff, FileArchive, FileCode, Download } from 'lucide-react';
+import { Plus, Edit2, Trash2, Upload, Eye, EyeOff, FileArchive, FileCode, Download, Github, RefreshCw, CheckCircle2, XCircle } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import toast from 'react-hot-toast';
-import { fetchProblems, createProblem, updateProblem, deleteProblem, uploadTests, fetchTests, importProblems } from '../api';
+import {
+  fetchProblems,
+  createProblem,
+  updateProblem,
+  deleteProblem,
+  uploadTests,
+  fetchTests,
+  importProblems,
+  importFromGithub,
+  syncTestsFromGithub
+} from '../api';
 
 function ProblemManager() {
   const [problems, setProblems] = useState([]);
@@ -24,11 +34,12 @@ function ProblemManager() {
   });
 
   const [importData, setImportData] = useState({
-    start_id: 0,
-    end_id: 0,
+    url: '',
+    download_tests: false,
   });
 
   const [importing, setImporting] = useState(false);
+  const [syncingTests, setSyncingTests] = useState(false);
 
   const loadProblems = useCallback(async () => {
     try {
@@ -103,8 +114,8 @@ function ProblemManager() {
     e.preventDefault();
     setImporting(true);
     try {
-      const response = await importProblems(importData);
-      toast.success(response.message);
+      const response = await importFromGithub(importData);
+      toast.success(response.message || 'Import started');
       setShowImportForm(false);
       // Since it's asynchronous, we might want to refresh after some time
       // or just tell the user to refresh. For now, let's refresh once.
@@ -113,6 +124,26 @@ function ProblemManager() {
       toast.error('Failed to start import: ' + error.message);
     } finally {
       setImporting(false);
+    }
+  };
+
+  const handleSyncTests = async (problemId) => {
+    setSyncingTests(true);
+    try {
+      const response = await syncTestsFromGithub(problemId);
+      toast.success(response.message || 'Sync started');
+      // Refresh problem details to show updated state if possible
+      // or just wait for it to complete.
+      setTimeout(() => {
+        loadProblems();
+        if (selectedProblem?.id === problemId) {
+          loadTests(problemId);
+        }
+      }, 2000);
+    } catch (error) {
+      toast.error('Failed to sync tests: ' + error.message);
+    } finally {
+      setSyncingTests(false);
     }
   };
 
@@ -171,8 +202,8 @@ function ProblemManager() {
             }}
             className="btn-secondary flex items-center space-x-2"
           >
-            {showImportForm ? <EyeOff className="h-4 w-4" /> : <Download className="h-4 w-4" />}
-            <span>{showImportForm ? 'Cancel' : 'Import from APPS'}</span>
+            {showImportForm ? <EyeOff className="h-4 w-4" /> : <Github className="h-4 w-4" />}
+            <span>{showImportForm ? 'Cancel' : 'Import from GitHub'}</span>
           </button>
           <button
             onClick={() => {
@@ -191,37 +222,36 @@ function ProblemManager() {
       {showImportForm && (
         <div className="card border-blue-500/30">
           <h2 className="text-lg font-semibold mb-4 flex items-center">
-            <Download className="h-5 w-5 mr-2 text-blue-400" />
-            Import Problems from APPS Dataset
+            <Github className="h-5 w-5 mr-2 text-blue-400" />
+            Import Problem from GitHub (IOI Format)
           </h2>
           <form onSubmit={handleImport} className="space-y-4">
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1">Start ID</label>
-                <input
-                  type="number"
-                  value={importData.start_id}
-                  onChange={(e) => setImportData({ ...importData, start_id: parseInt(e.target.value) })}
-                  className="input"
-                  min="0"
-                  required
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1">End ID</label>
-                <input
-                  type="number"
-                  value={importData.end_id}
-                  onChange={(e) => setImportData({ ...importData, end_id: parseInt(e.target.value) })}
-                  className="input"
-                  min="0"
-                  required
-                />
-              </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-1">GitHub URL</label>
+              <input
+                type="url"
+                value={importData.url}
+                onChange={(e) => setImportData({ ...importData, url: e.target.value })}
+                className="input"
+                placeholder="https://github.com/austrian-olympiad-informatics/ioi-tasks/tree/main/ioi2023-soccer"
+                required
+              />
+            </div>
+            <div className="flex items-center space-x-2">
+              <input
+                type="checkbox"
+                id="download_tests"
+                checked={importData.download_tests}
+                onChange={(e) => setImportData({ ...importData, download_tests: e.target.checked })}
+                className="rounded border-gray-700 bg-gray-800 text-blue-500 focus:ring-blue-500"
+              />
+              <label htmlFor="download_tests" className="text-sm text-gray-300">
+                Download tests immediately
+              </label>
             </div>
             <p className="text-xs text-gray-400">
-              Problems will be downloaded asynchronously from the APPS GitHub repository.
-              This may take a few moments per problem. Maximum 100 problems per batch.
+              The problem will be imported from the specified GitHub repository.
+              Tests can be downloaded now or later from the problem details page.
             </p>
             <div className="flex space-x-3">
               <button type="submit" className="btn-primary" disabled={importing}>
@@ -382,6 +412,46 @@ function ProblemManager() {
                 <ReactMarkdown>{selectedProblem.description || 'No description'}</ReactMarkdown>
               </div>
             </div>
+
+            {/* GitHub Info & Sync */}
+            {selectedProblem.source_url && (
+              <div className="card border-blue-500/20">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center space-x-2 text-blue-400">
+                    <Github className="h-4 w-4" />
+                    <span className="text-sm font-medium">Source: IOI GitHub</span>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    {selectedProblem.tests_downloaded ? (
+                      <span className="flex items-center text-xs text-green-400 bg-green-400/10 px-2 py-1 rounded-full">
+                        <CheckCircle2 className="h-3 w-3 mr-1" />
+                        Tests Ready
+                      </span>
+                    ) : (
+                      <span className="flex items-center text-xs text-yellow-400 bg-yellow-400/10 px-2 py-1 rounded-full">
+                        <XCircle className="h-3 w-3 mr-1" />
+                        Tests Missing
+                      </span>
+                    )}
+                  </div>
+                </div>
+                
+                <p className="text-xs text-gray-400 mb-4 truncate" title={selectedProblem.source_url}>
+                  {selectedProblem.source_url}
+                </p>
+
+                {!selectedProblem.tests_downloaded && (
+                  <button
+                    onClick={() => handleSyncTests(selectedProblem.id)}
+                    disabled={syncingTests}
+                    className="w-full btn-primary py-2 text-sm flex items-center justify-center space-x-2"
+                  >
+                    <RefreshCw className={`h-4 w-4 ${syncingTests ? 'animate-spin' : ''}`} />
+                    <span>{syncingTests ? 'Syncing...' : 'Sync Tests from GitHub'}</span>
+                  </button>
+                )}
+              </div>
+            )}
 
             {/* Test Upload */}
             <div className="card">

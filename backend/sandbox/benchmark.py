@@ -37,6 +37,7 @@ class BenchmarkConfig:
 @dataclass
 class TestCaseResult:
     """Result of running a single test case."""
+    __test__ = False
     test_index: int
     passed: bool
     actual_output: str
@@ -193,13 +194,13 @@ def _find_test_cases(test_cases_dir: Path) -> List[Tuple[Path, Path]]:
     ]
     
     for input_pattern, output_pattern in patterns:
-        for i in range(1, 1000):  # Reasonable upper limit
+        for i in range(0, 1000):  # Reasonable upper limit
             input_file = test_cases_dir / input_pattern.format(i)
             output_file = test_cases_dir / output_pattern.format(i)
             
             if input_file.exists() and output_file.exists():
                 test_cases.append((input_file, output_file))
-            elif i == 1 and not test_cases:
+            elif i == 0 and not test_cases:
                 # If first pattern doesn't work, try next
                 continue
             elif not input_file.exists():
@@ -244,9 +245,9 @@ async def _run_single_test(
     # Build harness command
     harness_cmd = [
         "/opt/harness/run_test",
-        solution_binary_path,
-        str(input_file),
-        str(expected_output_file),
+        "/tmp/solution.exe",
+        "/tmp/input.in",
+        "/tmp/expected.out",
         str(time_limit_ms),
         str(memory_limit_mb),
         str(benchmark_runs),
@@ -254,10 +255,15 @@ async def _run_single_test(
     ]
     
     # Mount volumes - binary must be accessible
+    # Use absolute paths for host side to avoid issues
+    host_sol_path = os.path.abspath(solution_binary_path)
+    host_in_path = os.path.abspath(str(input_file))
+    host_out_path = os.path.abspath(str(expected_output_file))
+
     volumes = {
-        solution_binary_path: {"bind": solution_binary_path, "mode": "ro"},
-        str(input_file): {"bind": str(input_file), "mode": "ro"},
-        str(expected_output_file): {"bind": str(expected_output_file), "mode": "ro"},
+        host_sol_path: {"bind": "/tmp/solution.exe", "mode": "ro"},
+        host_in_path: {"bind": "/tmp/input.in", "mode": "ro"},
+        host_out_path: {"bind": "/tmp/expected.out", "mode": "ro"},
     }
     
     # Run container with harness
@@ -391,8 +397,8 @@ async def _store_results(
     should_close_session = False
     
     if db_session is None:
-        db_session = await get_db_session().__anext__()
-        should_close_session = True
+        async with get_db_session() as session:
+            return await store_benchmark_results(summary, test_results, db_session=session)
     
     try:
         # Update Solution with aggregate stats
@@ -435,7 +441,7 @@ async def _store_results(
         logger.error(f"Failed to store benchmark results: {e}")
         raise
     finally:
-        if should_close_session:
+        if should_close_session and db_session:
             await db_session.close()
 
 
@@ -569,8 +575,8 @@ async def _update_solution_compile_status(
     should_close_session = False
     
     if db_session is None:
-        db_session = await get_db_session().__anext__()
-        should_close_session = True
+        async with get_db_session() as session:
+            return await update_solution_status(solution_id, success, compile_log, db_session=session)
     
     try:
         from sqlalchemy import update
@@ -590,5 +596,5 @@ async def _update_solution_compile_status(
         await db_session.rollback()
         logger.error(f"Failed to update solution status: {e}")
     finally:
-        if should_close_session:
+        if should_close_session and db_session:
             await db_session.close()

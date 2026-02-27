@@ -37,6 +37,15 @@ export const importProblems = (data) => apiRequest('/problems/import', {
   body: data,
 });
 
+export const importFromGithub = (data) => apiRequest('/problems/import/github', {
+  method: 'POST',
+  body: data,
+});
+
+export const syncTestsFromGithub = (problemId) => apiRequest(`/problems/${problemId}/tests/sync-github`, {
+  method: 'POST',
+});
+
 export const fetchProblem = (id) => apiRequest(`/problems/${id}`);
 
 export const createProblem = (data) => apiRequest('/problems/', {
@@ -154,6 +163,8 @@ export default {
   fetchProblems,
   fetchProblem,
   importProblems,
+  importFromGithub,
+  syncTestsFromGithub,
   createProblem,
   updateProblem,
   deleteProblem,

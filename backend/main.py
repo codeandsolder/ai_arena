@@ -29,7 +29,22 @@ from backend.api import (
 )
 from backend.config import ensure_directories
 from backend.database.migrations import create_tables
-from backend.database.session import close_engine
+from backend.database.session import close_engine, AsyncSessionLocal
+from backend.services.problem_ingestion import IOIIngestor
+
+
+async def ingest_default_problems():
+    """Background task to ingest default problems on startup."""
+    logger.info("Starting background ingestion of default problems...")
+    repo_url = "https://github.com/austrian-olympiad-informatics/ioi-tasks"
+    
+    try:
+        async with AsyncSessionLocal() as session:
+            async with IOIIngestor(session) as ingestor:
+                await ingestor.ingest_repository(repo_url)
+        logger.info("Background ingestion completed successfully.")
+    except Exception as e:
+        logger.error(f"Background ingestion failed: {e}")
 
 
 def check_docker_image() -> bool:
@@ -81,6 +96,9 @@ async def lifespan(app: FastAPI):
         )
     
     logger.info("AI Optimization Arena API started successfully!")
+    
+    # Start background ingestion of IOI tasks if needed
+    asyncio.create_task(ingest_default_problems())
     
     yield
     

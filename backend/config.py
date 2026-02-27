@@ -10,6 +10,10 @@ BASE_DIR = Path(__file__).parent.resolve()
 DATA_DIR = BASE_DIR / "data"
 RUNS_DIR = DATA_DIR / "runs"
 PROBLEMS_DIR = DATA_DIR / "problems"
+PROBLEMS_REPO_DIR = DATA_DIR / "problems_repo"
+
+# Problems Repository
+PROBLEMS_REPO_URL = os.environ.get("PROBLEMS_REPO_URL", "https://github.com/austrian-olympiad-informatics/ioi-tasks.git")
 
 # Database configuration
 DATABASE_PATH = DATA_DIR / "arena.db"
@@ -18,6 +22,7 @@ DATABASE_URL = f"sqlite+aiosqlite:///{DATABASE_PATH}"
 # API Configuration
 OPENROUTER_API_ENDPOINT = "https://openrouter.ai/api/v1"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 # Default run configuration
 DEFAULT_MODELS = [
@@ -127,6 +132,58 @@ def ensure_directories() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     PROBLEMS_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_problems_repo()
+
+
+def ensure_problems_repo() -> None:
+    """
+    Ensure the problems repository is cloned and up to date.
+    """
+    import subprocess
+    import shutil
+
+    if not PROBLEMS_REPO_DIR.exists():
+        print(f"Cloning problems repository from {PROBLEMS_REPO_URL}...")
+        try:
+            subprocess.run(
+                ["git", "clone", PROBLEMS_REPO_URL, str(PROBLEMS_REPO_DIR)],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            print("Successfully cloned problems repository. Pulling LFS files...")
+            subprocess.run(
+                ["git", "-C", str(PROBLEMS_REPO_DIR), "lfs", "pull"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            print("Successfully pulled LFS files.")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to setup problems repository: {e.stderr}")
+    else:
+        # Check if it's a git repo
+        if (PROBLEMS_REPO_DIR / ".git").exists():
+            print("Updating problems repository...")
+            try:
+                subprocess.run(
+                    ["git", "-C", str(PROBLEMS_REPO_DIR), "pull"],
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
+                print("Successfully updated problems repository. Pulling LFS files...")
+                subprocess.run(
+                    ["git", "-C", str(PROBLEMS_REPO_DIR), "lfs", "pull"],
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
+                print("Successfully updated LFS files.")
+            except subprocess.CalledProcessError as e:
+                print(f"Failed to update problems repository: {e.stderr}")
+        else:
+            print(f"Directory {PROBLEMS_REPO_DIR} exists but is not a git repository.")
 
 
 def validate_compiler(compiler: str) -> bool:

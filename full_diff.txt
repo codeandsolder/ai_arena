@@ -1,0 +1,1587 @@
+diff --git a/.gitignore b/.gitignore
+index 8f23647..a921e29 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -94,4 +94,5 @@ dist-ssr/
+ # Misc
+ *.bak
+ *.tmp
+-.cache/
+\ No newline at end of file
++.cache/
++backend/data/*
+diff --git a/backend/api/api_calls.py b/backend/api/api_calls.py
+index 454baa7..fee9140 100644
+--- a/backend/api/api_calls.py
++++ b/backend/api/api_calls.py
+@@ -8,7 +8,7 @@ from datetime import datetime
+ from typing import List, Optional
+ 
+ from fastapi import APIRouter, Depends, HTTPException, Query, status
+-from pydantic import BaseModel
++from pydantic import BaseModel, ConfigDict
+ from sqlalchemy import func, select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+@@ -38,8 +38,7 @@ class ApiCallListItem(BaseModel):
+     latency_ms: Optional[int]
+     created_at: datetime
+ 
+-    class Config:
+-        from_attributes = True
++    model_config = ConfigDict(from_attributes=True)
+ 
+ 
+ class ApiCallResponse(BaseModel):
+@@ -60,8 +59,7 @@ class ApiCallResponse(BaseModel):
+     latency_ms: Optional[int]
+     created_at: datetime
+ 
+-    class Config:
+-        from_attributes = True
++    model_config = ConfigDict(from_attributes=True)
+ 
+ 
+ class ApiCallListResponse(BaseModel):
+diff --git a/backend/api/problems.py b/backend/api/problems.py
+index e62f8a3..3c96f0c 100644
+--- a/backend/api/problems.py
++++ b/backend/api/problems.py
+@@ -12,7 +12,7 @@ from pathlib import Path
+ from typing import List, Optional
+ 
+ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, ConfigDict, Field
+ from sqlalchemy import select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+@@ -34,6 +34,12 @@ class ProblemImportRequest(BaseModel):
+     end_id: int = Field(..., ge=0, description="Ending APPS problem ID")
+ 
+ 
++class GitHubImportRequest(BaseModel):
++    """Schema for importing a problem from GitHub."""
++    url: str = Field(..., description="GitHub URL of the problem")
++    download_tests: bool = Field(default=False, description="Whether to download tests immediately")
++
++
+ class ProblemBase(BaseModel):
+     """Base problem schema with common fields."""
+     name: str = Field(..., min_length=1, max_length=255, description="Problem name")
+@@ -68,18 +74,18 @@ class ProblemListItem(BaseModel):
+     time_limit_ms: int
+     memory_limit_mb: int
+ 
+-    class Config:
+-        from_attributes = True
++    model_config = ConfigDict(from_attributes=True)
+ 
+ 
+ class ProblemResponse(ProblemBase):
+     """Schema for full problem response."""
+     id: int
+     test_count: int
++    source_url: Optional[str] = None
++    tests_downloaded: bool = False
+     created_at: datetime
+ 
+-    class Config:
+-        from_attributes = True
++    model_config = ConfigDict(from_attributes=True)
+ 
+ 
+ class TestCaseInfo(BaseModel):
+@@ -206,7 +212,7 @@ async def create_problem(problem_data: ProblemCreate, db: AsyncSession = Depends
+             detail=f"Problem with slug '{problem_data.slug}' already exists"
+         )
+     
+-    problem = Problem(**problem_data.dict())
++    problem = Problem(**problem_data.model_dump())
+     db.add(problem)
+     await db.commit()
+     await db.refresh(problem)
+@@ -257,7 +263,7 @@ async def update_problem(
+             )
+     
+     # Update fields
+-    update_data = problem_data.dict(exclude_unset=True)
++    update_data = problem_data.model_dump(exclude_unset=True)
+     for field, value in update_data.items():
+         setattr(problem, field, value)
+     
+@@ -316,6 +322,9 @@ async def upload_test_cases(
+     if tests_dir.exists():
+         shutil.rmtree(tests_dir)
+     tests_dir.mkdir(parents=True, exist_ok=True)
++
++    # 100 MB limit for uncompressed files to prevent Zip Bombs
++    MAX_UNCOMPRESSED_SIZE_BYTES = 100 * 1024 * 1024 
+     
+     # Save and extract ZIP
+     temp_zip_path = tests_dir / "temp_upload.zip"
+@@ -324,11 +333,22 @@ async def upload_test_cases(
+             content = await file.read()
+             f.write(content)
+         
+-        # Extract ZIP with path traversal validation (Zip Slip fix)
++        # Extract ZIP with path traversal and zip bomb validation
+         with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
+-            for member in zip_ref.namelist():
+-                member_path = tests_dir / member
+-                # Resolve the path and verify it's still within tests_dir
++            total_uncompressed_size = 0
++            
++            # Use infolist() to inspect file metadata before extraction
++            for member in zip_ref.infolist():
++                # 1. Zip Bomb Check
++                total_uncompressed_size += member.file_size
++                if total_uncompressed_size > MAX_UNCOMPRESSED_SIZE_BYTES:
++                    raise HTTPException(
++                        status_code=status.HTTP_400_BAD_REQUEST,
++                        detail=f"Uncompressed ZIP size exceeds maximum allowed limit of {MAX_UNCOMPRESSED_SIZE_BYTES / (1024*1024)}MB. Potential Zip Bomb detected."
++                    )
++                
++                # 2. Path Traversal Check (Zip Slip)
++                member_path = tests_dir / member.filename
+                 resolved_path = member_path.resolve()
+                 tests_dir_resolved = tests_dir.resolve()
+                 
+@@ -338,7 +358,7 @@ async def upload_test_cases(
+                         detail="Path traversal attempt detected in ZIP file"
+                     )
+             
+-            # All members are safe, now extract
++            # All members are safe and within size limits, now extract
+             zip_ref.extractall(tests_dir)
+         
+         # Remove the zip file after extraction
+@@ -469,4 +489,93 @@ async def import_problems(
+     
+     background_tasks.add_task(ingest_batch, import_data.start_id, count)
+     
+-    return {"message": f"Import of {count} problems started in the background"}
+\ No newline at end of file
++    return {"message": f"Import of {count} problems started in the background"}
++
++
++@router.post("/import/github", response_model=ProblemResponse, status_code=status.HTTP_201_CREATED)
++async def import_problem_from_github(
++    import_data: GitHubImportRequest,
++    background_tasks: BackgroundTasks,
++    db: AsyncSession = Depends(get_db)
++):
++    """
++    Import a single problem from a GitHub repository.
++    
++    Args:
++        import_data: GitHub URL to import
++        db: Database session
++        
++    Returns:
++        Created problem details
++    """
++    from backend.services.problem_ingestion import IOIIngestor
++    
++    async with IOIIngestor(db) as ingestor:
++        problem = await ingestor.ingest_from_github(import_data.url)
++        if not problem:
++            raise HTTPException(
++                status_code=status.HTTP_400_BAD_REQUEST,
++                detail="Failed to import problem from GitHub. Ensure the URL is correct and contains a PDF statement."
++            )
++        
++        if import_data.download_tests:
++            # Sync tests in background
++            from backend.database.session import AsyncSessionLocal
++            async def sync_task(p_id: int):
++                async with AsyncSessionLocal() as session:
++                    async with IOIIngestor(session) as sync_ingestor:
++                        await sync_ingestor.sync_tests(p_id)
++            
++            background_tasks.add_task(sync_task, problem.id)
++
++        return problem
++
++
++@router.post("/{problem_id}/tests/sync-github")
++async def sync_problem_tests_from_github(
++    problem_id: int,
++    background_tasks: BackgroundTasks,
++    db: AsyncSession = Depends(get_db)
++):
++    """
++    Sync test cases from GitHub for a problem.
++    Runs as a background task.
++    
++    Args:
++        problem_id: The problem ID
++        background_tasks: FastAPI background tasks
++        db: Database session
++        
++    Returns:
++        Status message
++    """
++    result = await db.execute(select(Problem).where(Problem.id == problem_id))
++    problem = result.scalar_one_or_none()
++    
++    if problem is None:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail=f"Problem with id {problem_id} not found"
++        )
++    
++    if not problem.source_url:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail=f"Problem {problem_id} was not imported from GitHub and has no source URL."
++        )
++
++    from backend.services.problem_ingestion import IOIIngestor
++
++    async def sync_task(p_id: int):
++        # We need a new session for the background task if the current one might be closed
++        # But for simplicity, we'll try using the current one or a new one inside ingestor
++        # The IOIIngestor expects a session. 
++        # Actually, background tasks should ideally get their own session.
++        from backend.database.session import AsyncSessionLocal
++        async with AsyncSessionLocal() as session:
++            async with IOIIngestor(session) as ingestor:
++                await ingestor.sync_tests(p_id)
++
++    background_tasks.add_task(sync_task, problem_id)
++    
++    return {"message": f"Test synchronization for problem {problem_id} started in the background"}
+diff --git a/backend/api/rounds.py b/backend/api/rounds.py
+index 28d332f..ef0e122 100644
+--- a/backend/api/rounds.py
++++ b/backend/api/rounds.py
+@@ -8,7 +8,7 @@ from datetime import datetime
+ from typing import List, Optional
+ 
+ from fastapi import APIRouter, Depends, HTTPException, status
+-from pydantic import BaseModel
++from pydantic import BaseModel, ConfigDict
+ from sqlalchemy import select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+@@ -34,8 +34,7 @@ class SolutionSummary(BaseModel):
+     avg_time_ms: Optional[float]
+     max_time_ms: Optional[float]
+ 
+-    class Config:
+-        from_attributes = True
++    model_config = ConfigDict(from_attributes=True)
+ 
+ 
+ class RoundListItem(BaseModel):
+diff --git a/backend/api/runs.py b/backend/api/runs.py
+index e524855..f78bd22 100644
+--- a/backend/api/runs.py
++++ b/backend/api/runs.py
+@@ -11,7 +11,7 @@ from datetime import datetime
+ from typing import Dict, List, Optional, Any
+ 
+ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+-from pydantic import BaseModel, Field, validator
++from pydantic import BaseModel, Field, field_validator, ConfigDict
+ from sqlalchemy import select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+@@ -85,19 +85,19 @@ class RunBase(BaseModel):
+ class RunCreate(RunBase):
+     """Schema for creating a run."""
+     
+-    @validator('config_json')
++    @field_validator('config_json')
++    @classmethod
+     def validate_config_json(cls, v):
+-        """Validate that config_json is valid JSON."""
++        """Validate that config_json is valid JSON and matches RunConfig schema."""
+         try:
+-            config = json.loads(v)
+-            # Basic validation that required fields exist
+-            if 'models' not in config:
+-                raise ValueError("config_json must contain 'models' field")
+-            if 'judge_model' not in config:
+-                raise ValueError("config_json must contain 'judge_model' field")
++            config_dict = json.loads(v)
++            # Validate the parsed dictionary against the strict RunConfig model
++            RunConfig(**config_dict)
+             return v
+         except json.JSONDecodeError as e:
+             raise ValueError(f"config_json must be valid JSON: {e}")
++        except Exception as e: # Catches Pydantic ValidationError from RunConfig
++            raise ValueError(f"Invalid configuration format: {str(e)}")
+ 
+ 
+ class RunUpdate(BaseModel):
+@@ -105,16 +105,20 @@ class RunUpdate(BaseModel):
+     name: Optional[str] = Field(None, min_length=1, max_length=255)
+     config_json: Optional[str] = None
+     
+-    @validator('config_json')
++    @field_validator('config_json')
++    @classmethod
+     def validate_config_json(cls, v):
+-        """Validate that config_json is valid JSON if provided."""
++        """Validate that config_json is valid JSON and matches RunConfig schema if provided."""
+         if v is None:
+             return v
+         try:
+-            json.loads(v)
++            config_dict = json.loads(v)
++            RunConfig(**config_dict)
+             return v
+         except json.JSONDecodeError as e:
+             raise ValueError(f"config_json must be valid JSON: {e}")
++        except Exception as e:
++            raise ValueError(f"Invalid configuration format: {str(e)}")
+ 
+ 
+ class RunListItem(BaseModel):
+@@ -135,9 +139,7 @@ class RunResponse(RunBase):
+     created_at: datetime
+     updated_at: datetime
+     config: Dict[str, Any]  # parsed from config_json
+-
+-    class Config:
+-        from_attributes = True
++    model_config = ConfigDict(from_attributes=True)
+ 
+ 
+ class StartRunRequest(BaseModel):
+@@ -355,11 +357,11 @@ async def update_run(
+     if not can_modify_run(run.status):
+         raise HTTPException(
+             status_code=status.HTTP_400_BAD_REQUEST,
+-            detail=f"Cannot update run with status '{run.status}'. Only 'configured' or 'paused' runs can be updated."
++            detail=f"Cannot update run with status '{run.status}'. Only 'configured', 'paused', or 'completed' runs can be updated."
+         )
+     
+     # Update fields
+-    update_data = run_data.dict(exclude_unset=True)
++    update_data = run_data.model_dump(exclude_unset=True)
+     for field, value in update_data.items():
+         setattr(run, field, value)
+     
+diff --git a/backend/api/solutions.py b/backend/api/solutions.py
+index 2fe2a64..067945b 100644
+--- a/backend/api/solutions.py
++++ b/backend/api/solutions.py
+@@ -8,7 +8,7 @@ from datetime import datetime
+ from typing import List, Optional
+ 
+ from fastapi import APIRouter, Depends, HTTPException, status
+-from pydantic import BaseModel
++from pydantic import BaseModel, ConfigDict
+ from sqlalchemy import select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+@@ -36,8 +36,7 @@ class TestResultResponse(BaseModel):
+     actual_output: Optional[str]
+     expected_output: Optional[str]
+ 
+-    class Config:
+-        from_attributes = True
++    model_config = ConfigDict(from_attributes=True)
+ 
+ 
+ class SolutionResponse(BaseModel):
+@@ -60,8 +59,7 @@ class SolutionResponse(BaseModel):
+     error_message: Optional[str]
+     created_at: datetime
+ 
+-    class Config:
+-        from_attributes = True
++    model_config = ConfigDict(from_attributes=True)
+ 
+ 
+ class SolutionTestsResponse(BaseModel):
+diff --git a/backend/config.py b/backend/config.py
+index 0456e4f..6ad00d0 100644
+--- a/backend/config.py
++++ b/backend/config.py
+@@ -10,6 +10,10 @@ BASE_DIR = Path(__file__).parent.resolve()
+ DATA_DIR = BASE_DIR / "data"
+ RUNS_DIR = DATA_DIR / "runs"
+ PROBLEMS_DIR = DATA_DIR / "problems"
++PROBLEMS_REPO_DIR = DATA_DIR / "problems_repo"
++
++# Problems Repository
++PROBLEMS_REPO_URL = os.environ.get("PROBLEMS_REPO_URL", "https://github.com/austrian-olympiad-informatics/ioi-tasks.git")
+ 
+ # Database configuration
+ DATABASE_PATH = DATA_DIR / "arena.db"
+@@ -18,6 +22,7 @@ DATABASE_URL = f"sqlite+aiosqlite:///{DATABASE_PATH}"
+ # API Configuration
+ OPENROUTER_API_ENDPOINT = "https://openrouter.ai/api/v1"
+ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
++GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+ 
+ # Default run configuration
+ DEFAULT_MODELS = [
+@@ -127,6 +132,58 @@ def ensure_directories() -> None:
+     DATA_DIR.mkdir(parents=True, exist_ok=True)
+     RUNS_DIR.mkdir(parents=True, exist_ok=True)
+     PROBLEMS_DIR.mkdir(parents=True, exist_ok=True)
++    ensure_problems_repo()
++
++
++def ensure_problems_repo() -> None:
++    """
++    Ensure the problems repository is cloned and up to date.
++    """
++    import subprocess
++    import shutil
++
++    if not PROBLEMS_REPO_DIR.exists():
++        print(f"Cloning problems repository from {PROBLEMS_REPO_URL}...")
++        try:
++            subprocess.run(
++                ["git", "clone", PROBLEMS_REPO_URL, str(PROBLEMS_REPO_DIR)],
++                check=True,
++                capture_output=True,
++                text=True
++            )
++            print("Successfully cloned problems repository. Pulling LFS files...")
++            subprocess.run(
++                ["git", "-C", str(PROBLEMS_REPO_DIR), "lfs", "pull"],
++                check=True,
++                capture_output=True,
++                text=True
++            )
++            print("Successfully pulled LFS files.")
++        except subprocess.CalledProcessError as e:
++            print(f"Failed to setup problems repository: {e.stderr}")
++    else:
++        # Check if it's a git repo
++        if (PROBLEMS_REPO_DIR / ".git").exists():
++            print("Updating problems repository...")
++            try:
++                subprocess.run(
++                    ["git", "-C", str(PROBLEMS_REPO_DIR), "pull"],
++                    check=True,
++                    capture_output=True,
++                    text=True
++                )
++                print("Successfully updated problems repository. Pulling LFS files...")
++                subprocess.run(
++                    ["git", "-C", str(PROBLEMS_REPO_DIR), "lfs", "pull"],
++                    check=True,
++                    capture_output=True,
++                    text=True
++                )
++                print("Successfully updated LFS files.")
++            except subprocess.CalledProcessError as e:
++                print(f"Failed to update problems repository: {e.stderr}")
++        else:
++            print(f"Directory {PROBLEMS_REPO_DIR} exists but is not a git repository.")
+ 
+ 
+ def validate_compiler(compiler: str) -> bool:
+diff --git a/backend/database/models.py b/backend/database/models.py
+index b8f2d08..83f5adf 100644
+--- a/backend/database/models.py
++++ b/backend/database/models.py
+@@ -38,6 +38,8 @@ class Problem(Base):
+     memory_limit_mb = Column(Integer, default=256, nullable=False)
+     test_count = Column(Integer, default=0, nullable=False)
+     scoring_mode = Column(String, default="binary", nullable=False)
++    source_url = Column(String, nullable=True)
++    tests_downloaded = Column(Boolean, default=False, nullable=False)
+     created_at = Column(DateTime, default=func.now(), nullable=False)
+ 
+     # Relationships
+@@ -130,6 +132,7 @@ class TestResult(Base):
+     """
+     Represents the result of running a solution against a single test case.
+     """
++    __test__ = False
+     __tablename__ = "test_results"
+ 
+     id = Column(Integer, primary_key=True, autoincrement=True)
+diff --git a/backend/database/session.py b/backend/database/session.py
+index c2be817..a75d80a 100644
+--- a/backend/database/session.py
++++ b/backend/database/session.py
+@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import (
+     create_async_engine,
+ )
+ from sqlalchemy.orm import sessionmaker
++from contextlib import asynccontextmanager
+ 
+ from backend.config import DATABASE_URL
+ 
+@@ -55,6 +56,17 @@ def get_session_maker() -> async_sessionmaker[AsyncSession]:
+     return _async_session_maker
+ 
+ 
++def AsyncSessionLocal():
++    """
++    Get a new async database session.
++    
++    This is a compatibility wrapper for code expecting a session factory.
++    Returns:
++        AsyncSession: A new SQLAlchemy async session.
++    """
++    return get_session_maker()()
++
++
+ async def get_db() -> AsyncSession:
+     """
+     FastAPI dependency function that yields an async database session.
+@@ -78,6 +90,7 @@ async def get_db() -> AsyncSession:
+             await session.close()
+ 
+ 
++@asynccontextmanager
+ async def get_db_session() -> AsyncSession:
+     """
+     Get a database session for non-FastAPI contexts.
+diff --git a/backend/main.py b/backend/main.py
+index 2d6ff37..f52941a 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -29,7 +29,22 @@ from backend.api import (
+ )
+ from backend.config import ensure_directories
+ from backend.database.migrations import create_tables
+-from backend.database.session import close_engine
++from backend.database.session import close_engine, AsyncSessionLocal
++from backend.services.problem_ingestion import IOIIngestor
++
++
++async def ingest_default_problems():
++    """Background task to ingest default problems on startup."""
++    logger.info("Starting background ingestion of default problems...")
++    repo_url = "https://github.com/austrian-olympiad-informatics/ioi-tasks"
++    
++    try:
++        async with AsyncSessionLocal() as session:
++            async with IOIIngestor(session) as ingestor:
++                await ingestor.ingest_repository(repo_url)
++        logger.info("Background ingestion completed successfully.")
++    except Exception as e:
++        logger.error(f"Background ingestion failed: {e}")
+ 
+ 
+ def check_docker_image() -> bool:
+@@ -82,6 +97,9 @@ async def lifespan(app: FastAPI):
+     
+     logger.info("AI Optimization Arena API started successfully!")
+     
++    # Start background ingestion of IOI tasks if needed
++    asyncio.create_task(ingest_default_problems())
++    
+     yield
+     
+     # Shutdown
+diff --git a/backend/orchestrator/engine.py b/backend/orchestrator/engine.py
+index a4ca9cb..68fdb19 100644
+--- a/backend/orchestrator/engine.py
++++ b/backend/orchestrator/engine.py
+@@ -193,6 +193,21 @@ class OrchestrationEngine:
+                     judge_model=config.judge_model
+                 )
+             
++            # Phase 0: Lazy Download Tests if needed
++            if not problem.tests_downloaded:
++                logger.info(f"Tests not downloaded for problem {problem.id}. Downloading now...")
++                await self.websocket_manager.broadcast_run_status(
++                    run_id=run_id,
++                    status="downloading_tests",
++                    message="Downloading problem tests from GitHub..."
++                )
++                from backend.services.problem_ingestion import IOIIngestor
++                async with IOIIngestor(db_session) as ingestor:
++                    await ingestor.sync_tests(problem.id)
++                # Refresh problem object to get updated tests_downloaded and test_count
++                await db_session.refresh(problem)
++                logger.info(f"Downloaded {problem.test_count} tests for problem {problem.id}")
++
+             # Run rounds
+             previous_summary = None
+             for round_num in range(1, num_rounds + 1):
+@@ -352,6 +367,13 @@ class OrchestrationEngine:
+             )
+             solutions_with_scores = list(solutions_result.scalars().all())
+             
++            # Ensure summarizer is initialized
++            if not self.summarizer:
++                self.summarizer = Summarizer(
++                    model_client=self.model_client,
++                    judge_model=config.judge_model
++                )
++            
+             summary = await self.summarizer.summarize_round(
+                 round_id=round_id,
+                 solutions=solutions_with_scores,
+@@ -956,6 +978,12 @@ class OrchestrationEngine:
+                         time_ms=result.time_ms
+                     )
+                 
++                # Update solution with benchmark metrics
++                solution.tests_passed = summary.tests_passed
++                solution.tests_total = summary.tests_total
++                solution.avg_time_ms = summary.avg_time_ms
++                solution.max_time_ms = summary.max_time_ms
++                solution.max_memory_kb = summary.max_memory_kb
+                 solution.status = "completed" if summary.all_passed else "failed"
+                 
+                 await self.websocket_manager.broadcast_solution_status(
+@@ -1119,11 +1147,9 @@ class OrchestrationEngine:
+         db_session: Optional[AsyncSession] = None
+     ):
+         """Update run status in database."""
+-        should_close = False
+         if db_session is None:
+             session_maker = get_session_maker()
+             db_session = session_maker()
+-            should_close = True
+         
+         try:
+             await db_session.execute(
+@@ -1134,10 +1160,10 @@ class OrchestrationEngine:
+             await db_session.commit()
+         except Exception as e:
+             logger.error(f"Failed to update run {run_id} status: {e}")
+-            await db_session.rollback()
+-        finally:
+-            if should_close:
+-                await db_session.close()
++            try:
++                await db_session.rollback()
++            except Exception as rollback_err:
++                logger.error(f"Failed to rollback: {rollback_err}")
+     
+     async def _update_round_status(
+         self,
+@@ -1151,7 +1177,11 @@ class OrchestrationEngine:
+             .where(Round.id == round_id)
+             .values(status=status)
+         )
+-        await db_session.commit()
++        try:
++            await db_session.commit()
++        except:
++            await db_session.rollback()
++            raise
+     
+     async def pause_run(self, run_id: int):
+         """
+@@ -1210,4 +1240,4 @@ class OrchestrationEngine:
+         
+         # Close summarizer
+         if self.summarizer:
+-            await self.summarizer.close()
++            await self.summarizer.close()
+\ No newline at end of file
+diff --git a/backend/orchestrator/summarizer.py b/backend/orchestrator/summarizer.py
+index 1e64f4f..4f5be3a 100644
+--- a/backend/orchestrator/summarizer.py
++++ b/backend/orchestrator/summarizer.py
+@@ -167,21 +167,8 @@ class Summarizer:
+             Approach explanation or default message
+         """
+         # Look for the API call that generated this solution
+-        if hasattr(solution, 'api_calls') and solution.api_calls:
+-            for api_call in solution.api_calls:
+-                if api_call.purpose == "solution_generation":
+-                    try:
+-                        # Parse the response to get explanation
+-                        response_text = api_call.response_text or ""
+-                        json_start = response_text.find("{")
+-                        json_end = response_text.rfind("}")
+-                        
+-                        if json_start != -1 and json_end != -1:
+-                            json_str = response_text[json_start:json_end + 1]
+-                            data = json.loads(json_str)
+-                            return data.get("explanation", "No explanation provided")
+-                    except json.JSONDecodeError:
+-                        continue
++        # In async mode, we cannot safely access relationships like api_calls lazily
++        return "No explanation provided"
+         
+         return "No explanation available"
+     
+diff --git a/backend/sandbox/benchmark.py b/backend/sandbox/benchmark.py
+index 51fcc37..c29845c 100644
+--- a/backend/sandbox/benchmark.py
++++ b/backend/sandbox/benchmark.py
+@@ -37,6 +37,7 @@ class BenchmarkConfig:
+ @dataclass
+ class TestCaseResult:
+     """Result of running a single test case."""
++    __test__ = False
+     test_index: int
+     passed: bool
+     actual_output: str
+@@ -391,8 +392,8 @@ async def _store_results(
+     should_close_session = False
+     
+     if db_session is None:
+-        db_session = await get_db_session().__anext__()
+-        should_close_session = True
++        async with get_db_session() as session:
++            return await store_benchmark_results(summary, test_results, db_session=session)
+     
+     try:
+         # Update Solution with aggregate stats
+@@ -435,7 +436,7 @@ async def _store_results(
+         logger.error(f"Failed to store benchmark results: {e}")
+         raise
+     finally:
+-        if should_close_session:
++        if should_close_session and db_session:
+             await db_session.close()
+ 
+ 
+@@ -569,8 +570,8 @@ async def _update_solution_compile_status(
+     should_close_session = False
+     
+     if db_session is None:
+-        db_session = await get_db_session().__anext__()
+-        should_close_session = True
++        async with get_db_session() as session:
++            return await update_solution_status(solution_id, success, compile_log, db_session=session)
+     
+     try:
+         from sqlalchemy import update
+@@ -590,5 +591,5 @@ async def _update_solution_compile_status(
+         await db_session.rollback()
+         logger.error(f"Failed to update solution status: {e}")
+     finally:
+-        if should_close_session:
++        if should_close_session and db_session:
+             await db_session.close()
+diff --git a/backend/sandbox/compiler.py b/backend/sandbox/compiler.py
+index f78739d..a841ec2 100644
+--- a/backend/sandbox/compiler.py
++++ b/backend/sandbox/compiler.py
+@@ -240,8 +240,13 @@ async def compile_solution(
+             return False, "", f"Failed to write source file: {e}", None
+         
+         # Build compilation command
++        # Use g++ instead of g++-14 on Windows for local testing
++        compiler_cmd = validated_compiler
++        if os.name == 'nt':
++            compiler_cmd = "g++"
++            
+         cmd = [
+-            validated_compiler,
++            compiler_cmd,
+             str(source_path),
+             "-o", safe_output_path,
+         ] + validated_flags
+diff --git a/backend/services/problem_ingestion.py b/backend/services/problem_ingestion.py
+index 7a7b5a2..f8fb080 100644
+--- a/backend/services/problem_ingestion.py
++++ b/backend/services/problem_ingestion.py
+@@ -11,14 +11,17 @@ import asyncio
+ import logging
+ import httpx
+ import re
++import gzip
+ from pathlib import Path
+ from typing import Dict, Any, List, Optional
+ from sqlalchemy import select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
++import pymupdf4llm
++from backend.config import GITHUB_TOKEN, PROBLEMS_DIR, PROBLEMS_REPO_DIR
+ from backend.database.models import Problem
+ from backend.database.session import AsyncSessionLocal
+-from backend.api.problems import get_problem_tests_dir, count_test_cases
++from backend.api.problems import get_problem_tests_dir
+ 
+ # Logging configuration
+ logging.basicConfig(level=logging.INFO)
+@@ -26,9 +29,396 @@ logger = logging.getLogger(__name__)
+ 
+ # Constants
+ APPS_GITHUB_BASE_URL = "https://raw.githubusercontent.com/hendrycks/apps/main/train"
++GITHUB_API_BASE = "https://api.github.com"
+ DEFAULT_TIME_LIMIT_MS = 2000
+ DEFAULT_MEMORY_LIMIT_MB = 256
+ 
++class IOIIngestor:
++    """Service to ingest problems from IOI GitHub repositories."""
++
++    def __init__(self, session: AsyncSession):
++        self.session = session
++        headers = {"Accept": "application/vnd.github.v3+json"}
++        if GITHUB_TOKEN:
++            headers["Authorization"] = f"token {GITHUB_TOKEN}"
++        self.client = httpx.AsyncClient(timeout=30.0, headers=headers)
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, exc_type, exc_val, exc_tb):
++        await self.client.aclose()
++
++    def _generate_slug(self, name: str) -> str:
++        """Generate a URL-friendly slug from a name."""
++        slug = name.lower()
++        slug = re.sub(r'[^a-z0-9]+', '-', slug)
++        return slug.strip('-')
++
++    def parse_github_url(self, url: str) -> Dict[str, str]:
++        """
++        Parses a GitHub URL to extract owner, repo, ref, and path.
++        Example: https://github.com/austrian-olympiad-informatics/ioi-tasks/tree/main/ioi2023-soccer
++        """
++        # Handle full repo URL: https://github.com/owner/repo
++        repo_only_pattern = r"https://github\.com/([^/]+)/([^/]+)/?$"
++        repo_match = re.match(repo_only_pattern, url)
++        if repo_match:
++            return {
++                "owner": repo_match.group(1),
++                "repo": repo_match.group(2),
++                "ref": "main",
++                "path": ""
++            }
++
++        pattern = r"https://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/(.*)"
++        match = re.match(pattern, url)
++        if not match:
++            # Try without tree/branch (defaults to main)
++            pattern_simple = r"https://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)"
++            match = re.match(pattern_simple, url)
++            if not match:
++                raise ValueError(f"Invalid GitHub URL: {url}")
++        
++        return {
++            "owner": match.group(1),
++            "repo": match.group(2),
++            "ref": match.group(3),
++            "path": match.group(4)
++        }
++
++    async def ingest_repository(self, repo_url: str):
++        """Recursively find and ingest all problems in a repository/directory."""
++        parsed = self.parse_github_url(repo_url)
++        contents = await self.fetch_contents(parsed["owner"], parsed["repo"], parsed["path"], parsed["ref"])
++        
++        # If the directory contains a .pdf file, it's likely a problem directory
++        is_problem_dir = any(item["name"].lower().endswith(".pdf") for item in contents if item["type"] == "file")
++        if not is_problem_dir:
++            # Also check 'statement' directory
++            is_problem_dir = any(item["name"].lower() == "statement" and item["type"] == "dir" for item in contents)
++
++        if is_problem_dir:
++            await self.ingest_from_github(repo_url)
++        else:
++            # Recursively explore subdirectories
++            for item in contents:
++                if item["type"] == "dir" and not item["name"].startswith("."):
++                    sub_url = f"https://github.com/{parsed['owner']}/{parsed['repo']}/tree/{parsed['ref']}/{item['path']}"
++                    await self.ingest_repository(sub_url)
++
++    async def fetch_contents(self, owner: str, repo: str, path: str, ref: str) -> List[Dict[str, Any]]:
++        """Fetch contents of a directory via GitHub API or local repository."""
++        # Try local repository first
++        local_dir = PROBLEMS_REPO_DIR / path
++        
++        # Completely short-circuit if the base problem repo exists locally
++        if PROBLEMS_REPO_DIR.exists():
++            if local_dir.exists() and local_dir.is_dir():
++                logger.info(f"Using local directory: {local_dir}")
++                items = []
++                for entry in local_dir.iterdir():
++                    item_type = "dir" if entry.is_dir() else "file"
++                    relative_path = str(entry.relative_to(PROBLEMS_REPO_DIR)).replace("\\", "/")
++                    items.append({
++                        "name": entry.name,
++                        "type": item_type,
++                        "path": relative_path,
++                        "download_url": f"local://{relative_path}"
++                    })
++                return items
++            else:
++                logger.warning(f"Local repo exists but path {path} not found. Short-circuiting GitHub API.")
++                return []
++
++        # Fallback to GitHub API (only if local repo does not exist at all)
++        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={ref}"
++        res = await self.client.get(url)
++        if res.status_code != 200:
++            logger.error(f"Failed to fetch contents for {path}: {res.status_code} {res.text}")
++            return []
++        return res.json()
++
++    async def download_file(self, download_url: str) -> bytes:
++        """Download a file from a URL or read from local repository."""
++        is_local = download_url.startswith("local://")
++        local_path = None
++        if is_local:
++            local_path = PROBLEMS_REPO_DIR / download_url[8:]
++            if local_path.exists() and local_path.is_file():
++                logger.info(f"Reading local file: {local_path}")
++                content = local_path.read_bytes()
++                
++                # Check if it's a Git LFS pointer (often happens if git-lfs is not installed or filter failed)
++                # Or if it's a small file containing a path (symlink-like)
++                if content.startswith(b"version https://git-lfs.github.com/spec/v1") or (len(content) < 100 and b"/" in content):
++                    logger.warning(f"File {local_path} appears to be a pointer or symlink. Falling back to GitHub.")
++                    # Fall through to HTTP download if possible
++                else:
++                    if local_path.suffix == ".gz":
++                        try:
++                            return gzip.decompress(content)
++                        except Exception as e:
++                            logger.error(f"Failed to decompress {local_path}: {e}")
++                    return content
++        
++        # Fallback to HTTP download
++        # If we had a local path, we need to construct the GitHub download URL
++        # download_url might already be a http url if fetch_contents fell back
++        actual_url = download_url
++        if is_local:
++            # Reconstruct from local path
++            # local://owner/repo/path -> https://raw.githubusercontent.com/owner/repo/main/path
++            # Wait, the local:// path we store is relative to PROBLEMS_REPO_DIR
++            # We need the original parsed info or just use the download_url if it was passed correctly.
++            # Actually, ingest_from_github and sync_tests use fetch_contents which returns 
++            # download_url=f"local://{relative_path}"
++            # This is not enough to reconstruct the GitHub URL unless we know the owner/repo.
++            # For now, let's assume we can't easily fallback if we don't have the full URL.
++            pass
++
++        if actual_url.startswith("local://"):
++            logger.error(f"Cannot fallback for {actual_url} - no remote URL available.")
++            return b""
++
++        res = await self.client.get(actual_url)
++        res.raise_for_status()
++        content = res.content
++        if actual_url.split("?")[0].endswith(".gz"):
++            try:
++                return gzip.decompress(content)
++            except:
++                pass
++        return content
++
++    async def ingest_from_github(self, github_url: str) -> Optional[Problem]:
++        """Fetch, parse, and store a problem from GitHub."""
++        logger.info(f"Starting ingestion from GitHub URL: {github_url}")
++        
++        parsed = self.parse_github_url(github_url)
++        contents = await self.fetch_contents(parsed["owner"], parsed["repo"], parsed["path"], parsed["ref"])
++        
++        # 1. Find the statement (PDF or MD)
++        # Search for a directory named 'statement', a .pdf file, or statement.md in the main path
++        pdf_url = None
++        pdf_name = None
++        statement_md_url = None
++        
++        for item in contents:
++            if item["type"] == "file":
++                if item["name"].lower().endswith(".pdf"):
++                    # Prefer English versions if multiple PDFs exist
++                    if not pdf_url or "en" in item["name"].lower():
++                        pdf_url = item["download_url"]
++                        pdf_name = item["name"]
++                elif item["name"].lower() == "statement.md":
++                    statement_md_url = item["download_url"]
++            
++            if item["type"] == "dir" and item["name"].lower() == "statement":
++                stmt_contents = await self.fetch_contents(parsed["owner"], parsed["repo"], item["path"], parsed["ref"])
++                for s_item in stmt_contents:
++                    if s_item["type"] == "file":
++                        if s_item["name"].lower().endswith(".pdf"):
++                            if not pdf_url or "en" in s_item["name"].lower():
++                                pdf_url = s_item["download_url"]
++                                pdf_name = s_item["name"]
++                        elif s_item["name"].lower() == "statement.md":
++                            statement_md_url = s_item["download_url"]
++        
++        description_md = ""
++        if statement_md_url:
++            logger.info(f"Downloading Markdown statement from {statement_md_url}")
++            md_bytes = await self.download_file(statement_md_url)
++            description_md = md_bytes.decode("utf-8")
++            if not pdf_name:
++                pdf_name = parsed["path"].split("/")[-1] if parsed["path"] else parsed["repo"]
++        elif pdf_url:
++            # 2. Download and Convert PDF
++            logger.info(f"Downloading PDF statement from {pdf_url}")
++            pdf_bytes = await self.download_file(pdf_url)
++            
++            temp_pdf = Path(f"temp_statement_{os.getpid()}.pdf")
++            temp_pdf.write_bytes(pdf_bytes)
++            
++            try:
++                # Use pymupdf4llm to extract content as markdown
++                # We use the path directly as pymupdf4llm.to_markdown handles it well
++                description_md = pymupdf4llm.to_markdown(str(temp_pdf))
++                
++                # Refine the extraction: usually IOI problems have a "Problem Statement" or "Task" section
++                # If the description is too long or contains a lot of boilerplate, we might need more logic
++                # For now, ensure it's not empty and clean up some common artifacts
++                if description_md:
++                    # Remove multiple newlines
++                    description_md = re.sub(r'\n{3,}', '\n\n', description_md)
++                    # Remove potential header/footer artifacts like page numbers if they are isolated
++                    description_md = re.sub(r'\n\s*\d+\s*\n', '\n', description_md)
++            finally:
++                if temp_pdf.exists():
++                    try:
++                        temp_pdf.unlink()
++                    except Exception as e:
++                        logger.error(f"Failed to delete temp PDF {temp_pdf}: {e}")
++        
++        if not description_md:
++            logger.error(f"No statement found at {github_url}")
++            return None
++
++        # 3. Create/Update Problem Record
++        problem_name = (pdf_name or "Unknown Problem").replace(".pdf", "").replace("-", " ").title()
++        slug = self._generate_slug(problem_name)
++        
++        result = await self.session.execute(select(Problem).where(Problem.slug == slug))
++        existing_problem = result.scalar_one_or_none()
++        
++        if existing_problem:
++            logger.info(f"Problem with slug '{slug}' already exists. Updating...")
++            problem = existing_problem
++            problem.name = problem_name
++            problem.description_md = description_md
++            problem.source_url = github_url
++        else:
++            problem = Problem(
++                name=problem_name,
++                slug=slug,
++                description_md=description_md,
++                source_url=github_url,
++                test_count=0,
++                tests_downloaded=False,
++                time_limit_ms=DEFAULT_TIME_LIMIT_MS,
++                memory_limit_mb=DEFAULT_MEMORY_LIMIT_MB,
++                scoring_mode="binary"
++            )
++            self.session.add(problem)
++        
++        await self.session.flush()
++        await self.session.commit()
++        
++        logger.info(f"Successfully ingested problem '{problem.name}' (ID: {problem.id}) from GitHub.")
++
++        # If we have local repository, sync tests immediately instead of lazily
++        if PROBLEMS_REPO_DIR.exists():
++            logger.info(f"Automatically syncing tests for {problem.name} from local repository.")
++            await self.sync_tests(problem.id)
++
++        return problem
++
++    async def sync_tests(self, problem_id: int) -> int:
++        """Download tests from GitHub for an existing problem."""
++        result = await self.session.execute(select(Problem).where(Problem.id == problem_id))
++        problem = result.scalar_one_or_none()
++        
++        if not problem or not problem.source_url:
++            logger.error(f"Problem {problem_id} not found or has no source URL.")
++            return 0
++        
++        parsed = self.parse_github_url(problem.source_url)
++        
++        # IOI usually has tests in a 'tests' directory
++        # We also look in 'data/secret' and 'data/sample' which is common in some tasks
++        # CMS/IOI structure: 'tc' for test cases, 'statement' for statements
++        search_paths = [
++            parsed["path"],
++            f"{parsed['path']}/tc",
++            f"{parsed['path']}/tests",
++            f"{parsed['path']}/data/secret",
++            f"{parsed['path']}/data/sample",
++            f"{parsed['path']}/data",
++            f"{parsed['path']}/tc/gen/data",
++            f"{parsed['path']}/tc/gen/manual",
++        ]
++        
++        # Collect all test files, possibly from subdirectories
++        async def collect_files(current_path: str) -> List[Dict[str, Any]]:
++            all_files = []
++            try:
++                items = await self.fetch_contents(parsed["owner"], parsed["repo"], current_path, parsed["ref"])
++            except Exception as e:
++                logger.warning(f"Failed to fetch contents for {current_path}: {e}")
++                return []
++            for item in items:
++                if item["type"] == "file":
++                    all_files.append(item)
++                elif item["type"] == "dir" and item["name"] not in (".", "..", "solution", "statement", "checker", "grader"):
++                    all_files.extend(await collect_files(item["path"]))
++            return all_files
++
++        test_files = []
++        tests_path = None
++        
++        # Try prioritized search paths first
++        for path in search_paths:
++            try:
++                files = await collect_files(path)
++                if any(f["name"].endswith(".in") or f["name"].endswith(".in.gz") for f in files):
++                    test_files = files
++                    tests_path = path
++                    break
++            except Exception as e:
++                logger.debug(f"Path {path} not found or error: {e}")
++                continue
++
++        if not test_files:
++            # Fallback to full recursive search from root path if not found in common paths
++            test_files = await collect_files(parsed["path"])
++            if any(f["name"].endswith(".in") or f["name"].endswith(".in.gz") for f in test_files):
++                tests_path = parsed["path"]
++            else:
++                test_files = []
++
++        if not test_files:
++            logger.error(f"No 'tests' directory or .in files found for problem {problem_id} in {search_paths}")
++            return 0
++        
++        tests_dir = get_problem_tests_dir(problem.id)
++        tests_dir.mkdir(parents=True, exist_ok=True)
++        
++        # IOI usually has .in and .out or .sol or .ans files
++        # We'll map them by base name
++        in_files = {}
++        out_files = {}
++        
++        for item in test_files:
++            name = item["name"]
++            # Remove .gz if present for mapping
++            mapping_name = name[:-3] if name.endswith(".gz") else name
++            
++            if mapping_name.endswith(".in"):
++                base = mapping_name[:-3]
++                in_files[base] = item["download_url"]
++            elif mapping_name.endswith(".out") or mapping_name.endswith(".sol") or mapping_name.endswith(".ans"):
++                # Handle various output extensions
++                # We need to be careful with dots in base name (e.g. 1.in, 1.ans)
++                # Split by the last dot to get the base
++                parts = mapping_name.rsplit(".", 1)
++                base = parts[0]
++                out_files[base] = item["download_url"]
++        
++        count = 0
++        # Sort bases to ensure deterministic ordering
++        for base in sorted(in_files.keys()):
++            if base in out_files:
++                logger.info(f"Downloading test case: {base}")
++                in_content = await self.download_file(in_files[base])
++                out_content = await self.download_file(out_files[base])
++                
++                if not in_content or not out_content:
++                    logger.warning(f"Skipping test case {base} due to empty content")
++                    continue
++
++                with open(tests_dir / f"{count}.in", "wb") as f:
++                    f.write(in_content)
++                with open(tests_dir / f"{count}.out", "wb") as f:
++                    f.write(out_content)
++                count += 1
++        
++        problem.test_count = count
++        problem.tests_downloaded = True
++        await self.session.commit()
++        
++        logger.info(f"Synced {count} tests for problem {problem_id}")
++        return count
++
+ class APPSIngestor:
+     """Service to ingest problems from the APPS dataset."""
+ 
+@@ -49,10 +439,46 @@ class APPSIngestor:
+         return slug.strip('-')
+ 
+     async def fetch_problem_data(self, problem_id_str: str) -> Optional[Dict[str, Any]]:
+-        """Fetch problem files from APPS GitHub repository."""
+-        # Note: APPS problems on GitHub are organized in directories named by ID (e.g., '0000', '0001')
+-        # We need question.txt and input_output.json
+-        
++        """Fetch problem files from local repository or APPS GitHub repository."""
++        # Try local repository first
++        # APPS problems on GitHub are organized in directories named by ID (e.g., '0000', '0001')
++        # They are usually under a 'train' or 'test' directory.
++        local_base = PROBLEMS_REPO_DIR / "train" / problem_id_str
++        if not (local_base.exists() and local_base.is_dir()):
++            local_base = PROBLEMS_REPO_DIR / problem_id_str
++
++        if local_base.exists() and local_base.is_dir():
++            logger.info(f"Using local APPS data from: {local_base}")
++            try:
++                desc_path = local_base / "question.txt"
++                if desc_path.exists():
++                    description = desc_path.read_text(encoding="utf-8")
++                else:
++                    logger.error(f"Missing question.txt in {local_base}")
++                    return None
++                
++                io_path = local_base / "input_output.json"
++                if io_path.exists():
++                    with open(io_path, "r", encoding="utf-8") as f:
++                        io_data = json.load(f)
++                else:
++                    logger.error(f"Missing input_output.json in {local_base}")
++                    return None
++
++                name_match = re.search(r'^#\s+(.*)$', description, re.MULTILINE)
++                name = name_match.group(1) if name_match else f"APPS Problem {problem_id_str}"
++                
++                return {
++                    "id_str": problem_id_str,
++                    "name": name,
++                    "description": description,
++                    "io": io_data
++                }
++            except Exception as e:
++                logger.error(f"Error reading local APPS problem {problem_id_str}: {e}")
++                # Fallback to download
++
++        # Fallback to GitHub raw
+         base_url = f"{APPS_GITHUB_BASE_URL}/{problem_id_str}"
+         
+         try:
+diff --git a/docker/Dockerfile.sandbox b/docker/Dockerfile.sandbox
+index 6dd2dc9..07ff881 100644
+--- a/docker/Dockerfile.sandbox
++++ b/docker/Dockerfile.sandbox
+@@ -20,8 +20,7 @@ RUN apt-get update && apt-get install -y \
+ # Add LLVM repository for clang versions
+ RUN wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc \
+     && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-18 main" \
+-    && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-17 main" \
+-    && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-16 main"
++    && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-17 main"
+ 
+ # Install GCC versions (12, 13, 14)
+ RUN apt-get update && apt-get install -y \
+@@ -33,9 +32,8 @@ RUN apt-get update && apt-get install -y \
+     g++-14 \
+     && rm -rf /var/lib/apt/lists/*
+ 
+-# Install Clang versions (16, 17, 18)
++# Install Clang versions (17, 18)
+ RUN apt-get update && apt-get install -y \
+-    clang-16 \
+     clang-17 \
+     clang-18 \
+     && rm -rf /var/lib/apt/lists/*
+diff --git a/docker/test_harness.cpp b/docker/test_harness.cpp
+index 839beb1..47a9435 100644
+--- a/docker/test_harness.cpp
++++ b/docker/test_harness.cpp
+@@ -24,6 +24,7 @@
+ #include <fcntl.h>
+ #include <errno.h>
+ #include <ctime>
++#include <iomanip>
+ 
+ // JSON output helpers
+ std::string escape_json(const std::string& str) {
+diff --git a/frontend/src/api.js b/frontend/src/api.js
+index bc6f7c5..4d2c190 100644
+--- a/frontend/src/api.js
++++ b/frontend/src/api.js
+@@ -37,6 +37,15 @@ export const importProblems = (data) => apiRequest('/problems/import', {
+   body: data,
+ });
+ 
++export const importFromGithub = (data) => apiRequest('/problems/import/github', {
++  method: 'POST',
++  body: data,
++});
++
++export const syncTestsFromGithub = (problemId) => apiRequest(`/problems/${problemId}/tests/sync-github`, {
++  method: 'POST',
++});
++
+ export const fetchProblem = (id) => apiRequest(`/problems/${id}`);
+ 
+ export const createProblem = (data) => apiRequest('/problems/', {
+@@ -154,6 +163,8 @@ export default {
+   fetchProblems,
+   fetchProblem,
+   importProblems,
++  importFromGithub,
++  syncTestsFromGithub,
+   createProblem,
+   updateProblem,
+   deleteProblem,
+diff --git a/frontend/src/pages/ProblemManager.jsx b/frontend/src/pages/ProblemManager.jsx
+index 92b7331..17064a4 100644
+--- a/frontend/src/pages/ProblemManager.jsx
++++ b/frontend/src/pages/ProblemManager.jsx
+@@ -1,8 +1,18 @@
+ import React, { useState, useEffect, useCallback } from 'react';
+-import { Plus, Edit2, Trash2, Upload, Eye, EyeOff, FileArchive, FileCode, Download } from 'lucide-react';
++import { Plus, Edit2, Trash2, Upload, Eye, EyeOff, FileArchive, FileCode, Download, Github, RefreshCw, CheckCircle2, XCircle } from 'lucide-react';
+ import ReactMarkdown from 'react-markdown';
+ import toast from 'react-hot-toast';
+-import { fetchProblems, createProblem, updateProblem, deleteProblem, uploadTests, fetchTests, importProblems } from '../api';
++import {
++  fetchProblems,
++  createProblem,
++  updateProblem,
++  deleteProblem,
++  uploadTests,
++  fetchTests,
++  importProblems,
++  importFromGithub,
++  syncTestsFromGithub
++} from '../api';
+ 
+ function ProblemManager() {
+   const [problems, setProblems] = useState([]);
+@@ -24,11 +34,12 @@ function ProblemManager() {
+   });
+ 
+   const [importData, setImportData] = useState({
+-    start_id: 0,
+-    end_id: 0,
++    url: '',
++    download_tests: false,
+   });
+ 
+   const [importing, setImporting] = useState(false);
++  const [syncingTests, setSyncingTests] = useState(false);
+ 
+   const loadProblems = useCallback(async () => {
+     try {
+@@ -103,8 +114,8 @@ function ProblemManager() {
+     e.preventDefault();
+     setImporting(true);
+     try {
+-      const response = await importProblems(importData);
+-      toast.success(response.message);
++      const response = await importFromGithub(importData);
++      toast.success(response.message || 'Import started');
+       setShowImportForm(false);
+       // Since it's asynchronous, we might want to refresh after some time
+       // or just tell the user to refresh. For now, let's refresh once.
+@@ -116,6 +127,26 @@ function ProblemManager() {
+     }
+   };
+ 
++  const handleSyncTests = async (problemId) => {
++    setSyncingTests(true);
++    try {
++      const response = await syncTestsFromGithub(problemId);
++      toast.success(response.message || 'Sync started');
++      // Refresh problem details to show updated state if possible
++      // or just wait for it to complete.
++      setTimeout(() => {
++        loadProblems();
++        if (selectedProblem?.id === problemId) {
++          loadTests(problemId);
++        }
++      }, 2000);
++    } catch (error) {
++      toast.error('Failed to sync tests: ' + error.message);
++    } finally {
++      setSyncingTests(false);
++    }
++  };
++
+   const handleFileUpload = async (problemId, file) => {
+     if (!file) return;
+     
+@@ -171,8 +202,8 @@ function ProblemManager() {
+             }}
+             className="btn-secondary flex items-center space-x-2"
+           >
+-            {showImportForm ? <EyeOff className="h-4 w-4" /> : <Download className="h-4 w-4" />}
+-            <span>{showImportForm ? 'Cancel' : 'Import from APPS'}</span>
++            {showImportForm ? <EyeOff className="h-4 w-4" /> : <Github className="h-4 w-4" />}
++            <span>{showImportForm ? 'Cancel' : 'Import from GitHub'}</span>
+           </button>
+           <button
+             onClick={() => {
+@@ -191,37 +222,36 @@ function ProblemManager() {
+       {showImportForm && (
+         <div className="card border-blue-500/30">
+           <h2 className="text-lg font-semibold mb-4 flex items-center">
+-            <Download className="h-5 w-5 mr-2 text-blue-400" />
+-            Import Problems from APPS Dataset
++            <Github className="h-5 w-5 mr-2 text-blue-400" />
++            Import Problem from GitHub (IOI Format)
+           </h2>
+           <form onSubmit={handleImport} className="space-y-4">
+-            <div className="grid grid-cols-2 gap-4">
+-              <div>
+-                <label className="block text-sm font-medium text-gray-300 mb-1">Start ID</label>
+-                <input
+-                  type="number"
+-                  value={importData.start_id}
+-                  onChange={(e) => setImportData({ ...importData, start_id: parseInt(e.target.value) })}
+-                  className="input"
+-                  min="0"
+-                  required
+-                />
+-              </div>
+-              <div>
+-                <label className="block text-sm font-medium text-gray-300 mb-1">End ID</label>
+-                <input
+-                  type="number"
+-                  value={importData.end_id}
+-                  onChange={(e) => setImportData({ ...importData, end_id: parseInt(e.target.value) })}
+-                  className="input"
+-                  min="0"
+-                  required
+-                />
+-              </div>
++            <div>
++              <label className="block text-sm font-medium text-gray-300 mb-1">GitHub URL</label>
++              <input
++                type="url"
++                value={importData.url}
++                onChange={(e) => setImportData({ ...importData, url: e.target.value })}
++                className="input"
++                placeholder="https://github.com/austrian-olympiad-informatics/ioi-tasks/tree/main/ioi2023-soccer"
++                required
++              />
++            </div>
++            <div className="flex items-center space-x-2">
++              <input
++                type="checkbox"
++                id="download_tests"
++                checked={importData.download_tests}
++                onChange={(e) => setImportData({ ...importData, download_tests: e.target.checked })}
++                className="rounded border-gray-700 bg-gray-800 text-blue-500 focus:ring-blue-500"
++              />
++              <label htmlFor="download_tests" className="text-sm text-gray-300">
++                Download tests immediately
++              </label>
+             </div>
+             <p className="text-xs text-gray-400">
+-              Problems will be downloaded asynchronously from the APPS GitHub repository.
+-              This may take a few moments per problem. Maximum 100 problems per batch.
++              The problem will be imported from the specified GitHub repository.
++              Tests can be downloaded now or later from the problem details page.
+             </p>
+             <div className="flex space-x-3">
+               <button type="submit" className="btn-primary" disabled={importing}>
+@@ -383,6 +413,46 @@ function ProblemManager() {
+               </div>
+             </div>
+ 
++            {/* GitHub Info & Sync */}
++            {selectedProblem.source_url && (
++              <div className="card border-blue-500/20">
++                <div className="flex items-center justify-between mb-4">
++                  <div className="flex items-center space-x-2 text-blue-400">
++                    <Github className="h-4 w-4" />
++                    <span className="text-sm font-medium">Source: IOI GitHub</span>
++                  </div>
++                  <div className="flex items-center space-x-2">
++                    {selectedProblem.tests_downloaded ? (
++                      <span className="flex items-center text-xs text-green-400 bg-green-400/10 px-2 py-1 rounded-full">
++                        <CheckCircle2 className="h-3 w-3 mr-1" />
++                        Tests Ready
++                      </span>
++                    ) : (
++                      <span className="flex items-center text-xs text-yellow-400 bg-yellow-400/10 px-2 py-1 rounded-full">
++                        <XCircle className="h-3 w-3 mr-1" />
++                        Tests Missing
++                      </span>
++                    )}
++                  </div>
++                </div>
++                
++                <p className="text-xs text-gray-400 mb-4 truncate" title={selectedProblem.source_url}>
++                  {selectedProblem.source_url}
++                </p>
++
++                {!selectedProblem.tests_downloaded && (
++                  <button
++                    onClick={() => handleSyncTests(selectedProblem.id)}
++                    disabled={syncingTests}
++                    className="w-full btn-primary py-2 text-sm flex items-center justify-center space-x-2"
++                  >
++                    <RefreshCw className={`h-4 w-4 ${syncingTests ? 'animate-spin' : ''}`} />
++                    <span>{syncingTests ? 'Syncing...' : 'Sync Tests from GitHub'}</span>
++                  </button>
++                )}
++              </div>
++            )}
++
+             {/* Test Upload */}
+             <div className="card">
+               <h3 className="font-medium mb-3 flex items-center">
+diff --git a/pyproject.toml b/pyproject.toml
+index 49773ba..047c06c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -15,6 +15,7 @@ dependencies = [
+     "pydantic>=2.5.0",
+     "websockets>=12.0",
+     "python-dotenv>=1.0.0",
++    "pymupdf4llm",
+ ]
+ 
+ [project.optional-dependencies]
+@@ -26,9 +27,21 @@ dev = [
+     "mypy>=1.7.0",
+ ]
+ 
++[dependency-groups]
++dev = [
++    "pytest>=7.4.0",
++    "pytest-asyncio>=0.21.0",
++    "black>=23.0.0",
++    "ruff>=0.1.0",
++    "mypy>=1.7.0",
++]
++
+ [project.scripts]
+ arena = "backend.main:main"
+ 
++[tool.hatch.build.targets.wheel]
++packages = ["backend"]
++
+ [tool.uv]
+ default-groups = ["dev"]
+ 
+@@ -46,6 +59,9 @@ warn_return_any = true
+ warn_unused_configs = true
+ disallow_untyped_defs = true
+ 
++[tool.pytest.ini_options]
++asyncio_mode = "auto"
++
+ [build-system]
+ requires = ["hatchling"]
+ build-backend = "hatchling.build"
+\ No newline at end of file
+diff --git a/start.bat b/start.bat
+index b1b2b54..8af2255 100644
+--- a/start.bat
++++ b/start.bat
+@@ -10,15 +10,14 @@ cd /d "%~dp0"
+ 
+ :: Start Backend
+ echo Starting Backend...
+-start "Arena Backend" cmd /k "if exist .venv\Scripts\activate.bat (call .venv\Scripts\activate.bat) else if exist venv\Scripts\activate.bat (call venv\Scripts\activate.bat) & python -m backend.main"
++start "Arena Backend" cmd /k "cd /d "%~dp0" && (if exist .venv\Scripts\activate.bat (call .venv\Scripts\activate.bat) else if exist venv\Scripts\activate.bat (call venv\Scripts\activate.bat)) && python -m backend.main"
+ 
+ :: Wait for backend to initialize
+ timeout /t 3 /nobreak > nul
+ 
+ :: Start Frontend
+ echo Starting Frontend...
+-cd frontend
+-start "Arena Frontend" cmd /k "npm run dev"
++start "Arena Frontend" cmd /k "cd /d "%~dp0frontend" && npm run dev"
+ 
+ :: Wait for frontend to start
+ timeout /t 5 /nobreak > nul
+@@ -33,4 +32,4 @@ echo - Backend: http://localhost:8000
+ echo - Frontend: http://localhost:5173
+ echo.
+ echo Close the terminal windows to stop the services.
+-pause
++pause
+\ No newline at end of file

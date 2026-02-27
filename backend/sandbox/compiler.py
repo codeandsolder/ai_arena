@@ -12,6 +12,7 @@ import logging
 import re
 import tempfile
 import os
+import subprocess
 from pathlib import Path
 from typing import List, Tuple, Optional, Set
 
@@ -26,6 +27,7 @@ WHITELISTED_COMPILERS: Set[str] = {
     "clang++-16",
     "clang++-17",
     "clang++-18",
+    "x86_64-w64-mingw32-g++",
 }
 
 # Default compiler if requested one is not whitelisted
@@ -225,7 +227,10 @@ async def compile_solution(
             return False, "", error_msg, None
     
     # Create temporary directory for compilation
-    with tempfile.TemporaryDirectory() as temp_dir:
+    # Use TemporaryDirectory and handle cleanup errors on Windows
+    temp_dir_obj = tempfile.TemporaryDirectory()
+    temp_dir = temp_dir_obj.name
+    try:
         # Force output_path to be within temp_dir to prevent directory traversal
         output_filename = Path(output_path).name
         safe_output_path = str(Path(temp_dir) / output_filename)
@@ -240,11 +245,43 @@ async def compile_solution(
             return False, "", f"Failed to write source file: {e}", None
         
         # Build compilation command
-        cmd = [
-            validated_compiler,
-            str(source_path),
-            "-o", safe_output_path,
-        ] + validated_flags
+        # Use wsl x86_64-w64-mingw32-g++ on Windows for local testing
+        if os.name == 'nt':
+            # Convert Windows path to WSL path
+            # e.g., C:\Users\Jan\... -> /mnt/c/Users/Jan/...
+            def to_wsl_path(win_path: str) -> str:
+                try:
+                    # use wslpath utility if available via wsl
+                    result = subprocess.run(
+                        ["wsl", "wslpath", "-a", win_path.replace("\\", "/")],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    return result.stdout.strip()
+                except Exception:
+                    # Fallback to manual conversion for simple cases
+                    path = win_path.replace("\\", "/")
+                    if ":" in path:
+                        drive, rest = path.split(":", 1)
+                        return f"/mnt/{drive.lower()}{rest}"
+                    return path
+
+            wsl_source_path = to_wsl_path(str(source_path))
+            wsl_output_path = to_wsl_path(safe_output_path)
+
+            cmd = [
+                "wsl",
+                "g++",
+                wsl_source_path,
+                "-o", wsl_output_path,
+            ] + validated_flags
+        else:
+            cmd = [
+                validated_compiler,
+                str(source_path),
+                "-o", safe_output_path,
+            ] + validated_flags
         
         logger.info(f"Compiling with command: {' '.join(cmd)}")
         
@@ -271,6 +308,11 @@ async def compile_solution(
             stdout_str = stdout.decode("utf-8", errors="replace")
             stderr_str = stderr.decode("utf-8", errors="replace")
             
+            if process.returncode != 0:
+                logger.error(f"Compilation failed with exit code {process.returncode}")
+                logger.error(f"Stdout: {stdout_str}")
+                logger.error(f"Stderr: {stderr_str}")
+            
             if process.returncode == 0:
                 # Compilation successful
                 # Copy binary from temp to output_path before returning
@@ -295,6 +337,12 @@ async def compile_solution(
         except Exception as e:
             logger.error(f"Compilation error: {e}")
             return False, "", f"Compilation error: {e}", None
+    finally:
+        try:
+            temp_dir_obj.cleanup()
+        except:
+            # On Windows, cleanup can fail due to file locks
+            pass
 
 
 async def compile_in_container(

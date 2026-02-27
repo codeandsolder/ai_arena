@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -85,19 +85,19 @@ class RunBase(BaseModel):
 class RunCreate(RunBase):
     """Schema for creating a run."""
     
-    @validator('config_json')
+    @field_validator('config_json')
+    @classmethod
     def validate_config_json(cls, v):
-        """Validate that config_json is valid JSON."""
+        """Validate that config_json is valid JSON and matches RunConfig schema."""
         try:
-            config = json.loads(v)
-            # Basic validation that required fields exist
-            if 'models' not in config:
-                raise ValueError("config_json must contain 'models' field")
-            if 'judge_model' not in config:
-                raise ValueError("config_json must contain 'judge_model' field")
+            config_dict = json.loads(v)
+            # Validate the parsed dictionary against the strict RunConfig model
+            RunConfig(**config_dict)
             return v
         except json.JSONDecodeError as e:
             raise ValueError(f"config_json must be valid JSON: {e}")
+        except Exception as e: # Catches Pydantic ValidationError from RunConfig
+            raise ValueError(f"Invalid configuration format: {str(e)}")
 
 
 class RunUpdate(BaseModel):
@@ -105,16 +105,20 @@ class RunUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     config_json: Optional[str] = None
     
-    @validator('config_json')
+    @field_validator('config_json')
+    @classmethod
     def validate_config_json(cls, v):
-        """Validate that config_json is valid JSON if provided."""
+        """Validate that config_json is valid JSON and matches RunConfig schema if provided."""
         if v is None:
             return v
         try:
-            json.loads(v)
+            config_dict = json.loads(v)
+            RunConfig(**config_dict)
             return v
         except json.JSONDecodeError as e:
             raise ValueError(f"config_json must be valid JSON: {e}")
+        except Exception as e:
+            raise ValueError(f"Invalid configuration format: {str(e)}")
 
 
 class RunListItem(BaseModel):
@@ -135,9 +139,7 @@ class RunResponse(RunBase):
     created_at: datetime
     updated_at: datetime
     config: Dict[str, Any]  # parsed from config_json
-
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class StartRunRequest(BaseModel):
@@ -355,11 +357,11 @@ async def update_run(
     if not can_modify_run(run.status):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot update run with status '{run.status}'. Only 'configured' or 'paused' runs can be updated."
+            detail=f"Cannot update run with status '{run.status}'. Only 'configured', 'paused', or 'completed' runs can be updated."
         )
     
     # Update fields
-    update_data = run_data.dict(exclude_unset=True)
+    update_data = run_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(run, field, value)
     

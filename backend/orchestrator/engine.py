@@ -193,6 +193,21 @@ class OrchestrationEngine:
                     judge_model=config.judge_model
                 )
             
+            # Phase 0: Lazy Download Tests if needed
+            if not problem.tests_downloaded:
+                logger.info(f"Tests not downloaded for problem {problem.id}. Downloading now...")
+                await self.websocket_manager.broadcast_run_status(
+                    run_id=run_id,
+                    status="downloading_tests",
+                    message="Downloading problem tests from GitHub..."
+                )
+                from backend.services.problem_ingestion import IOIIngestor
+                async with IOIIngestor(db_session) as ingestor:
+                    await ingestor.sync_tests(problem.id)
+                # Refresh problem object to get updated tests_downloaded and test_count
+                await db_session.refresh(problem)
+                logger.info(f"Downloaded {problem.test_count} tests for problem {problem.id}")
+
             # Run rounds
             previous_summary = None
             for round_num in range(1, num_rounds + 1):
@@ -351,6 +366,13 @@ class OrchestrationEngine:
                 select(Solution).where(Solution.round_id == round_id)
             )
             solutions_with_scores = list(solutions_result.scalars().all())
+            
+            # Ensure summarizer is initialized
+            if not self.summarizer:
+                self.summarizer = Summarizer(
+                    model_client=self.model_client,
+                    judge_model=config.judge_model
+                )
             
             summary = await self.summarizer.summarize_round(
                 round_id=round_id,
@@ -956,6 +978,12 @@ class OrchestrationEngine:
                         time_ms=result.time_ms
                     )
                 
+                # Update solution with benchmark metrics
+                solution.tests_passed = summary.tests_passed
+                solution.tests_total = summary.tests_total
+                solution.avg_time_ms = summary.avg_time_ms
+                solution.max_time_ms = summary.max_time_ms
+                solution.max_memory_kb = summary.max_memory_kb
                 solution.status = "completed" if summary.all_passed else "failed"
                 
                 await self.websocket_manager.broadcast_solution_status(
@@ -1134,7 +1162,10 @@ class OrchestrationEngine:
             await db_session.commit()
         except Exception as e:
             logger.error(f"Failed to update run {run_id} status: {e}")
-            await db_session.rollback()
+            try:
+                await db_session.rollback()
+            except Exception as rollback_err:
+                logger.error(f"Failed to rollback: {rollback_err}")
         finally:
             if should_close:
                 await db_session.close()
@@ -1151,7 +1182,11 @@ class OrchestrationEngine:
             .where(Round.id == round_id)
             .values(status=status)
         )
-        await db_session.commit()
+        try:
+            await db_session.commit()
+        except:
+            await db_session.rollback()
+            raise
     
     async def pause_run(self, run_id: int):
         """

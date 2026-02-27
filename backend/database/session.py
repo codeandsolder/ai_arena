@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import sessionmaker
+from contextlib import asynccontextmanager
 
 from backend.config import DATABASE_URL
 
@@ -55,6 +56,17 @@ def get_session_maker() -> async_sessionmaker[AsyncSession]:
     return _async_session_maker
 
 
+def AsyncSessionLocal():
+    """
+    Get a new async database session.
+    
+    This is a compatibility wrapper for code expecting a session factory.
+    Returns:
+        AsyncSession: A new SQLAlchemy async session.
+    """
+    return get_session_maker()()
+
+
 async def get_db() -> AsyncSession:
     """
     FastAPI dependency function that yields an async database session.
@@ -78,6 +90,7 @@ async def get_db() -> AsyncSession:
             await session.close()
 
 
+@asynccontextmanager
 async def get_db_session() -> AsyncSession:
     """
     Get a database session for non-FastAPI contexts.

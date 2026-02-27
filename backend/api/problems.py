@@ -12,11 +12,11 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.config import PROBLEMS_DIR
+from backend import config
 from backend.database.models import Problem
 from backend.database.session import get_db
 
@@ -32,6 +32,12 @@ class ProblemImportRequest(BaseModel):
     """Schema for importing problems from APPS dataset."""
     start_id: int = Field(..., ge=0, description="Starting APPS problem ID")
     end_id: int = Field(..., ge=0, description="Ending APPS problem ID")
+
+
+class GitHubImportRequest(BaseModel):
+    """Schema for importing a problem from GitHub."""
+    url: str = Field(..., description="GitHub URL of the problem")
+    download_tests: bool = Field(default=False, description="Whether to download tests immediately")
 
 
 class ProblemBase(BaseModel):
@@ -68,18 +74,18 @@ class ProblemListItem(BaseModel):
     time_limit_ms: int
     memory_limit_mb: int
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ProblemResponse(ProblemBase):
     """Schema for full problem response."""
     id: int
     test_count: int
+    source_url: Optional[str] = None
+    tests_downloaded: bool = False
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TestCaseInfo(BaseModel):
@@ -102,7 +108,7 @@ class TestCaseListResponse(BaseModel):
 
 def get_problem_tests_dir(problem_id: int) -> Path:
     """Get the directory path for problem test cases."""
-    return PROBLEMS_DIR / str(problem_id) / "tests"
+    return config.PROBLEMS_DIR / str(problem_id) / "tests"
 
 
 def count_test_cases(tests_dir: Path) -> int:
@@ -206,13 +212,13 @@ async def create_problem(problem_data: ProblemCreate, db: AsyncSession = Depends
             detail=f"Problem with slug '{problem_data.slug}' already exists"
         )
     
-    problem = Problem(**problem_data.dict())
+    problem = Problem(**problem_data.model_dump())
     db.add(problem)
     await db.commit()
     await db.refresh(problem)
     
     # Create problem directory
-    problem_dir = PROBLEMS_DIR / str(problem.id)
+    problem_dir = config.PROBLEMS_DIR / str(problem.id)
     problem_dir.mkdir(parents=True, exist_ok=True)
     
     return problem
@@ -257,7 +263,7 @@ async def update_problem(
             )
     
     # Update fields
-    update_data = problem_data.dict(exclude_unset=True)
+    update_data = problem_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(problem, field, value)
     
@@ -316,6 +322,9 @@ async def upload_test_cases(
     if tests_dir.exists():
         shutil.rmtree(tests_dir)
     tests_dir.mkdir(parents=True, exist_ok=True)
+
+    # 100 MB limit for uncompressed files to prevent Zip Bombs
+    MAX_UNCOMPRESSED_SIZE_BYTES = 100 * 1024 * 1024 
     
     # Save and extract ZIP
     temp_zip_path = tests_dir / "temp_upload.zip"
@@ -324,21 +333,32 @@ async def upload_test_cases(
             content = await file.read()
             f.write(content)
         
-        # Extract ZIP with path traversal validation (Zip Slip fix)
+        # Extract ZIP with path traversal and zip bomb validation
         with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
-            for member in zip_ref.namelist():
-                member_path = tests_dir / member
-                # Resolve the path and verify it's still within tests_dir
+            total_uncompressed_size = 0
+            
+            # Use infolist() to inspect file metadata before extraction
+            for member in zip_ref.infolist():
+                # 1. Zip Bomb Check
+                total_uncompressed_size += member.file_size
+                if total_uncompressed_size > MAX_UNCOMPRESSED_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Uncompressed ZIP size exceeds maximum allowed limit of {MAX_UNCOMPRESSED_SIZE_BYTES / (1024*1024)}MB. Potential Zip Bomb detected."
+                    )
+                
+                # 2. Path Traversal Check (Zip Slip)
+                member_path = tests_dir / member.filename
                 resolved_path = member_path.resolve()
                 tests_dir_resolved = tests_dir.resolve()
                 
-                if not str(resolved_path).startswith(str(tests_dir_resolved)):
+                if not resolved_path.is_relative_to(tests_dir_resolved):
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="Path traversal attempt detected in ZIP file"
                     )
             
-            # All members are safe, now extract
+            # All members are safe and within size limits, now extract
             zip_ref.extractall(tests_dir)
         
         # Remove the zip file after extraction
@@ -423,7 +443,7 @@ async def delete_problem(problem_id: int, db: AsyncSession = Depends(get_db)):
         )
     
     # Delete test files
-    problem_dir = PROBLEMS_DIR / str(problem_id)
+    problem_dir = config.PROBLEMS_DIR / str(problem_id)
     if problem_dir.exists():
         shutil.rmtree(problem_dir)
     
@@ -470,3 +490,92 @@ async def import_problems(
     background_tasks.add_task(ingest_batch, import_data.start_id, count)
     
     return {"message": f"Import of {count} problems started in the background"}
+
+
+@router.post("/import/github", response_model=ProblemResponse, status_code=status.HTTP_201_CREATED)
+async def import_problem_from_github(
+    import_data: GitHubImportRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Import a single problem from a GitHub repository.
+    
+    Args:
+        import_data: GitHub URL to import
+        db: Database session
+        
+    Returns:
+        Created problem details
+    """
+    from backend.services.problem_ingestion import IOIIngestor
+    
+    async with IOIIngestor(db) as ingestor:
+        problem = await ingestor.ingest_from_github(import_data.url)
+        if not problem:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to import problem from GitHub. Ensure the URL is correct and contains a PDF statement."
+            )
+        
+        if import_data.download_tests:
+            # Sync tests in background
+            from backend.database.session import AsyncSessionLocal
+            async def sync_task(p_id: int):
+                async with AsyncSessionLocal() as session:
+                    async with IOIIngestor(session) as sync_ingestor:
+                        await sync_ingestor.sync_tests(p_id)
+            
+            background_tasks.add_task(sync_task, problem.id)
+
+        return problem
+
+
+@router.post("/{problem_id}/tests/sync-github")
+async def sync_problem_tests_from_github(
+    problem_id: int,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Sync test cases from GitHub for a problem.
+    Runs as a background task.
+    
+    Args:
+        problem_id: The problem ID
+        background_tasks: FastAPI background tasks
+        db: Database session
+        
+    Returns:
+        Status message
+    """
+    result = await db.execute(select(Problem).where(Problem.id == problem_id))
+    problem = result.scalar_one_or_none()
+    
+    if problem is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Problem with id {problem_id} not found"
+        )
+    
+    if not problem.source_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Problem {problem_id} was not imported from GitHub and has no source URL."
+        )
+
+    from backend.services.problem_ingestion import IOIIngestor
+
+    async def sync_task(p_id: int):
+        # We need a new session for the background task if the current one might be closed
+        # But for simplicity, we'll try using the current one or a new one inside ingestor
+        # The IOIIngestor expects a session. 
+        # Actually, background tasks should ideally get their own session.
+        from backend.database.session import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            async with IOIIngestor(session) as ingestor:
+                await ingestor.sync_tests(p_id)
+
+    background_tasks.add_task(sync_task, problem_id)
+    
+    return {"message": f"Test synchronization for problem {problem_id} started in the background"}

@@ -10,15 +10,14 @@ cd /d "%~dp0"
 
 :: Start Backend
 echo Starting Backend...
-start "Arena Backend" cmd /k "if exist .venv\Scripts\activate.bat (call .venv\Scripts\activate.bat) else if exist venv\Scripts\activate.bat (call venv\Scripts\activate.bat) & python -m backend.main"
+start "Arena Backend" cmd /k "cd /d "%~dp0" && (if exist .venv\Scripts\activate.bat (call .venv\Scripts\activate.bat) else if exist venv\Scripts\activate.bat (call venv\Scripts\activate.bat)) && python -m backend.main"
 
 :: Wait for backend to initialize
 timeout /t 3 /nobreak > nul
 
 :: Start Frontend
 echo Starting Frontend...
-cd frontend
-start "Arena Frontend" cmd /k "npm run dev"
+start "Arena Frontend" cmd /k "cd /d "%~dp0frontend" && npm run dev"
 
 :: Wait for frontend to start
 timeout /t 5 /nobreak > nul

@@ -38,6 +38,8 @@ class Problem(Base):
     memory_limit_mb = Column(Integer, default=256, nullable=False)
     test_count = Column(Integer, default=0, nullable=False)
     scoring_mode = Column(String, default="binary", nullable=False)
+    source_url = Column(String, nullable=True)
+    tests_downloaded = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)
 
     # Relationships
@@ -130,6 +132,7 @@ class TestResult(Base):
     """
     Represents the result of running a solution against a single test case.
     """
+    __test__ = False
     __tablename__ = "test_results"
 
     id = Column(Integer, primary_key=True, autoincrement=True)

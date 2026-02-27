@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <ctime>
+#include <iomanip>
 
 // JSON output helpers
 std::string escape_json(const std::string& str) {
