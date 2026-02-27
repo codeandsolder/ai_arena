@@ -1,0 +1,159 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply dark;
+  }
+  
+  body {
+    @apply bg-gray-900 text-gray-100 antialiased;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply px-4 py-2 rounded-lg font-medium transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900;
+  }
+  
+  .btn-primary {
+    @apply btn bg-blue-600 hover:bg-blue-500 text-white focus:ring-blue-500;
+  }
+  
+  .btn-secondary {
+    @apply btn bg-gray-700 hover:bg-gray-600 text-gray-100 focus:ring-gray-500;
+  }
+  
+  .btn-danger {
+    @apply btn bg-red-600 hover:bg-red-500 text-white focus:ring-red-500;
+  }
+  
+  .btn-success {
+    @apply btn bg-green-600 hover:bg-green-500 text-white focus:ring-green-500;
+  }
+  
+  .btn-warning {
+    @apply btn bg-yellow-600 hover:bg-yellow-500 text-white focus:ring-yellow-500;
+  }
+  
+  .card {
+    @apply bg-gray-800 border border-gray-700 rounded-lg p-6;
+  }
+  
+  .input {
+    @apply w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent;
+  }
+  
+  .input-textarea {
+    @apply input font-mono text-sm;
+  }
+  
+  .table-container {
+    @apply overflow-x-auto rounded-lg border border-gray-700;
+  }
+  
+  .table {
+    @apply w-full text-left text-sm;
+  }
+  
+  .table thead {
+    @apply bg-gray-800 text-gray-300 uppercase text-xs;
+  }
+  
+  .table th {
+    @apply px-4 py-3 font-semibold;
+  }
+  
+  .table tbody {
+    @apply divide-y divide-gray-700 bg-gray-900;
+  }
+  
+  .table td {
+    @apply px-4 py-3;
+  }
+  
+  .table tr:hover {
+    @apply bg-gray-800/50;
+  }
+}
+
+/* Syntax highlighting styles for highlight.js */
+.hljs {
+  @apply bg-gray-950 text-gray-100 rounded-lg;
+}
+
+.hljs-keyword {
+  @apply text-purple-400;
+}
+
+.hljs-string {
+  @apply text-green-400;
+}
+
+.hljs-number {
+  @apply text-orange-400;
+}
+
+.hljs-comment {
+  @apply text-gray-500 italic;
+}
+
+.hljs-function {
+  @apply text-blue-400;
+}
+
+.hljs-class {
+  @apply text-yellow-400;
+}
+
+.hljs-variable {
+  @apply text-cyan-400;
+}
+
+.hljs-operator {
+  @apply text-pink-400;
+}
+
+.hljs-punctuation {
+  @apply text-gray-400;
+}
+
+/* Scrollbar styles */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-gray-800;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-600 rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-gray-500;
+}
+
+/* Toast notification styles */
+.toast-container {
+  @apply z-50;
+}
+
+.toast-success {
+  @apply bg-green-600 text-white;
+}
+
+.toast-error {
+  @apply bg-red-600 text-white;
+}
+
+.toast-info {
+  @apply bg-blue-600 text-white;
+}
+
+.toast-warning {
+  @apply bg-yellow-600 text-white;
+}

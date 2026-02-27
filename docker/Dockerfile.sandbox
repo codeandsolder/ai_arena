@@ -1,0 +1,65 @@
+# Ubuntu 24.04 based sandbox image for AI Optimization Arena
+# Provides isolated, secure environment for compiling and running C++ code
+
+FROM ubuntu:24.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install base dependencies and repositories
+RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    wget \
+    curl \
+    gnupg \
+    lsb-release \
+    ca-certificates \
+    time \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add LLVM repository for clang versions
+RUN wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc \
+    && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-18 main" \
+    && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-17 main" \
+    && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-16 main"
+
+# Install GCC versions (12, 13, 14)
+RUN apt-get update && apt-get install -y \
+    gcc-12 \
+    g++-12 \
+    gcc-13 \
+    g++-13 \
+    gcc-14 \
+    g++-14 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Clang versions (16, 17, 18)
+RUN apt-get update && apt-get install -y \
+    clang-16 \
+    clang-17 \
+    clang-18 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create symlinks for convenience (but compilers will be called by full name)
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100
+
+# Create harness directory
+RUN mkdir -p /opt/harness
+
+# Copy and compile test harness
+COPY test_harness.cpp /opt/harness/
+RUN g++-14 -O2 -o /opt/harness/run_test /opt/harness/test_harness.cpp \
+    && chmod +x /opt/harness/run_test
+
+# Create workspace directory
+RUN mkdir -p /workspace && chmod 777 /workspace
+
+# Create a non-root user for running untrusted code
+RUN groupadd -r sandboxuser && useradd -r -g sandboxuser -d /workspace sandboxuser
+
+# Set working directory
+WORKDIR /workspace
+
+# Default command
+CMD ["/bin/bash"]
