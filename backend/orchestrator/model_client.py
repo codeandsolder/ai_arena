@@ -34,6 +34,11 @@ class ModelResponse:
     cost_usd: float
     latency_ms: int
     thinking_text: Optional[str] = None
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    # Cost reported directly by OpenRouter (includes cache discounts/surcharges
+    # applied by the upstream provider). None if not present in the response.
+    reported_cost_usd: Optional[float] = None
 
 
 class ModelClientError(Exception):
@@ -42,7 +47,7 @@ class ModelClientError(Exception):
 
 
 class RateLimitError(ModelClientError):
-    """Raised when rate limit is hit."""
+    """Raised when rate limit is hit and all retries are exhausted."""
     pass
 
 
@@ -54,7 +59,7 @@ class ModelClient:
     - Automatic pricing fetching and caching
     - Rate limit handling with exponential backoff
     - Cost calculation
-    - Timeout handling
+    - Timeout handling with retry
     - Retry logic for transient failures
     """
     
@@ -76,7 +81,6 @@ class ModelClient:
         if not self.api_key:
             logger.warning("No OpenRouter API key provided. Set OPENROUTER_API_KEY env var.")
         
-        # Create async HTTP client
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
             headers={
@@ -85,7 +89,7 @@ class ModelClient:
                 "HTTP-Referer": "https://ai-optimization-arena.local",
                 "X-Title": "AI Optimization Arena"
             },
-            timeout=120.0  # 120 second timeout per request
+            timeout=120.0
         )
         
         logger.info(f"ModelClient initialized with base URL: {base_url}")
@@ -104,14 +108,12 @@ class ModelClient:
         """
         global _PRICING_CACHE, _PRICING_CACHE_TIMESTAMP
         
-        # Check if cache is still valid
         current_time = time.time()
-        if not force_refresh and _PRICING_CACHE:
+        if not force_refresh and _PRICING_CACHE_TIMESTAMP > 0:
             if current_time - _PRICING_CACHE_TIMESTAMP < _PRICING_CACHE_TTL_SECONDS:
                 logger.debug("Using cached pricing data")
                 return _PRICING_CACHE
         
-        # Fetch fresh pricing data
         try:
             logger.info("Fetching model pricing from OpenRouter...")
             response = await self.client.get("/models")
@@ -120,16 +122,22 @@ class ModelClient:
             data = response.json()
             models = data.get("data", [])
             
-            # Build pricing cache
             pricing = {}
             for model in models:
                 model_id = model.get("id", "")
                 pricing_info = model.get("pricing", {})
-                pricing[model_id] = {
+                entry = {
                     "input_price": float(pricing_info.get("prompt", 0)),
                     "output_price": float(pricing_info.get("completion", 0)),
                     "name": model.get("name", model_id),
                 }
+                # Cache pricing fields (absent means provider does not expose them;
+                # fall back to input_price multiples at cost-calculation time).
+                if "cache_read" in pricing_info:
+                    entry["cache_read_price"] = float(pricing_info["cache_read"])
+                if "cache_write" in pricing_info:
+                    entry["cache_write_price"] = float(pricing_info["cache_write"])
+                pricing[model_id] = entry
             
             _PRICING_CACHE = pricing
             _PRICING_CACHE_TIMESTAMP = current_time
@@ -139,7 +147,6 @@ class ModelClient:
             
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error fetching pricing: {e.response.status_code} - {e.response.text}")
-            # Return cached data if available, even if expired
             if _PRICING_CACHE:
                 logger.warning("Using expired cached pricing due to fetch error")
                 return _PRICING_CACHE
@@ -157,38 +164,56 @@ class ModelClient:
         model_slug: str,
         input_tokens: int,
         output_tokens: int,
-        pricing: Dict[str, Any]
+        pricing: Dict[str, Any],
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
     ) -> float:
         """
-        Calculate the cost of an API call.
-        
+        Calculate the cost of an API call, including cached context.
+
+        Cache read/write prices are taken from the pricing dict when available
+        (populated from the OpenRouter /models endpoint). If they are absent,
+        the method falls back to the most common multiples of the base input
+        price (0.1x for reads, 1.25x for writes) so cost estimation degrades
+        gracefully rather than silently ignoring cache tokens.
+
         Args:
             model_slug: The model used
-            input_tokens: Number of input tokens
+            input_tokens: Number of non-cached input tokens
             output_tokens: Number of output tokens
             pricing: Pricing dictionary from fetch_pricing
-            
+            cache_read_tokens: Tokens read from the cache (cache hits)
+            cache_write_tokens: Tokens written to the cache (cache misses that
+                                were stored for future reuse)
+
         Returns:
-            Cost in USD
+            Estimated cost in USD
         """
         model_pricing = pricing.get(model_slug, {})
-        
-        # Prices are per 1M tokens
+
         input_price = model_pricing.get("input_price", 0)
         output_price = model_pricing.get("output_price", 0)
-        
+        # Use explicit cache prices when the endpoint provides them; otherwise
+        # fall back to the Anthropic defaults (most conservative estimate).
+        cache_read_price = model_pricing.get("cache_read_price", input_price * 0.1)
+        cache_write_price = model_pricing.get("cache_write_price", input_price * 1.25)
+
         input_cost = (input_tokens / 1_000_000) * input_price
         output_cost = (output_tokens / 1_000_000) * output_price
-        
-        total_cost = input_cost + output_cost
-        
+        cache_read_cost = (cache_read_tokens / 1_000_000) * cache_read_price
+        cache_write_cost = (cache_write_tokens / 1_000_000) * cache_write_price
+
+        total_cost = input_cost + output_cost + cache_read_cost + cache_write_cost
+
         logger.debug(
             f"Cost calculation for {model_slug}: "
-            f"input={input_tokens} tokens @ ${input_price}/1M, "
-            f"output={output_tokens} tokens @ ${output_price}/1M, "
+            f"input={input_tokens} @ ${input_price}/1M, "
+            f"output={output_tokens} @ ${output_price}/1M, "
+            f"cache_read={cache_read_tokens} @ ${cache_read_price}/1M, "
+            f"cache_write={cache_write_tokens} @ ${cache_write_price}/1M, "
             f"total=${total_cost:.6f}"
         )
-        
+
         return total_cost
     
     async def call_model(
@@ -211,19 +236,17 @@ class ModelClient:
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature (0.0 - 2.0)
             thinking_budget: Optional thinking budget for models that support it
-            max_retries: Maximum number of retries for rate limits
+            max_retries: Maximum number of attempts (including the first)
             
         Returns:
             ModelResponse with parsed results
             
         Raises:
             ModelClientError: If the API call fails after all retries
-            RateLimitError: If rate limited and retries exhausted
+            RateLimitError: If rate limited and all retries are exhausted
         """
-        # Fetch pricing data
         pricing = await self.fetch_pricing()
         
-        # Build request payload
         payload = {
             "model": model_slug,
             "messages": [
@@ -234,16 +257,15 @@ class ModelClient:
             "temperature": temperature,
         }
         
-        # Add thinking budget if specified
         if thinking_budget is not None and thinking_budget > 0:
             payload["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": thinking_budget
             }
         
-        # Retry logic with exponential backoff
         last_error = None
-        base_delay = 2.0  # Start with 2 seconds
+        rate_limited = False
+        base_delay = 2.0
         
         for attempt in range(max_retries):
             start_time = time.time()
@@ -251,28 +273,24 @@ class ModelClient:
             try:
                 logger.debug(f"Calling model {model_slug} (attempt {attempt + 1}/{max_retries})")
                 
-                response = await self.client.post(
-                    "/chat/completions",
-                    json=payload
-                )
+                response = await self.client.post("/chat/completions", json=payload)
                 
                 latency_ms = int((time.time() - start_time) * 1000)
                 
-                # Handle rate limiting
+                # Handle rate limiting via status code (before raise_for_status)
                 if response.status_code == 429:
+                    rate_limited = True
                     retry_after = response.headers.get("Retry-After")
                     delay = float(retry_after) if retry_after else base_delay * (2 ** attempt)
+                    last_error = f"Rate limited (attempt {attempt + 1})"
                     logger.warning(f"Rate limited. Retrying after {delay}s...")
                     await asyncio.sleep(delay)
                     continue
                 
-                # Handle other HTTP errors
                 response.raise_for_status()
                 
-                # Parse response
                 data = response.json()
                 
-                # Extract content
                 choices = data.get("choices", [])
                 if not choices:
                     raise ModelClientError("No choices in API response")
@@ -280,11 +298,9 @@ class ModelClient:
                 message = choices[0].get("message", {})
                 content = message.get("content", "")
                 
-                # Extract thinking content if available (Claude extended thinking)
                 thinking_text = None
                 thinking_tokens = 0
                 
-                # Check for thinking content in various formats
                 if "thinking" in message:
                     thinking_data = message["thinking"]
                     if isinstance(thinking_data, dict):
@@ -293,24 +309,37 @@ class ModelClient:
                     elif isinstance(thinking_data, str):
                         thinking_text = thinking_data
                 
-                # Extract usage
                 usage = data.get("usage", {})
                 input_tokens = usage.get("prompt_tokens", 0)
                 output_tokens = usage.get("completion_tokens", 0)
-                
-                # Some APIs report total tokens differently
+
                 if "total_tokens" in usage and output_tokens == 0:
                     output_tokens = usage["total_tokens"] - input_tokens
-                
-                # Calculate cost
+
+                prompt_details = usage.get("prompt_tokens_details", {})
+                cache_read_tokens = prompt_details.get("cached_tokens", 0)
+                cache_write_tokens = prompt_details.get("cache_write_tokens", 0)
+
+                # OpenRouter reports the actual charged cost in usage.cost (USD
+                # cents as a float, or 0 when not present). Use it for
+                # transparency; also compute our own estimate for attribution.
+                reported_cost_usd: Optional[float] = None
+                if "cost" in usage:
+                    reported_cost_usd = float(usage["cost"])
+
                 cost_usd = self._calculate_cost(
-                    model_slug, input_tokens, output_tokens, pricing
+                    model_slug, input_tokens, output_tokens, pricing,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
                 )
                 
                 logger.info(
                     f"Model call successful: {model_slug}, "
                     f"tokens={input_tokens}+{output_tokens}, "
-                    f"cost=${cost_usd:.6f}, latency={latency_ms}ms"
+                    f"cache_read={cache_read_tokens}, cache_write={cache_write_tokens}, "
+                    f"cost=${cost_usd:.6f}"
+                    + (f" (reported: ${reported_cost_usd:.6f})" if reported_cost_usd is not None else "")
+                    + f", latency={latency_ms}ms"
                 )
                 
                 return ModelResponse(
@@ -320,17 +349,22 @@ class ModelClient:
                     thinking_tokens=thinking_tokens,
                     cost_usd=cost_usd,
                     latency_ms=latency_ms,
-                    thinking_text=thinking_text
+                    thinking_text=thinking_text,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    reported_cost_usd=reported_cost_usd,
                 )
                 
             except httpx.TimeoutException as e:
                 last_error = f"Request timeout: {e}"
-                logger.error(f"Timeout calling model {model_slug}: {e}")
-                # Don't retry on timeout, just fail
-                break
+                logger.error(f"Timeout calling model {model_slug} (attempt {attempt + 1}): {e}")
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+                continue
                 
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 429:
+                    rate_limited = True
                     last_error = f"Rate limited: {e.response.text}"
                     delay = base_delay * (2 ** attempt)
                     logger.warning(f"Rate limited on attempt {attempt + 1}. Retrying in {delay}s...")
@@ -339,14 +373,15 @@ class ModelClient:
                 else:
                     last_error = f"HTTP error {e.response.status_code}: {e.response.text}"
                     logger.error(f"HTTP error calling model {model_slug}: {last_error}")
-                    # Don't retry on 4xx errors except 429
                     if 400 <= e.response.status_code < 500:
                         break
-                    # Retry on 5xx errors
                     delay = base_delay * (2 ** attempt)
                     await asyncio.sleep(delay)
                     continue
                     
+            except ModelClientError:
+                raise
+
             except Exception as e:
                 last_error = f"Unexpected error: {e}"
                 logger.error(f"Error calling model {model_slug}: {e}")
@@ -354,9 +389,10 @@ class ModelClient:
                 await asyncio.sleep(delay)
                 continue
         
-        # All retries exhausted
         error_msg = f"Failed to call model {model_slug} after {max_retries} attempts: {last_error}"
         logger.error(error_msg)
+        if rate_limited:
+            raise RateLimitError(error_msg)
         raise ModelClientError(error_msg)
     
     async def call_model_with_retry(
@@ -379,7 +415,7 @@ class ModelClient:
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             thinking_budget: Optional thinking budget
-            json_parse_retries: Number of retries for JSON parsing failures
+            json_parse_retries: Number of additional attempts if JSON parsing fails (0 = no retry)
             
         Returns:
             Tuple of (ModelResponse, parsed_json or None)
@@ -393,13 +429,11 @@ class ModelClient:
             thinking_budget=thinking_budget
         )
         
-        # Try to parse JSON
         parsed_json = None
         content = response.response_text
         
         for attempt in range(json_parse_retries + 1):
             try:
-                # Look for JSON object in the response
                 json_start = content.find("{")
                 json_end = content.rfind("}")
                 
@@ -414,8 +448,11 @@ class ModelClient:
                 logger.warning(f"JSON parse error (attempt {attempt + 1}): {e}")
                 
                 if attempt < json_parse_retries:
-                    # Retry with a reminder to output valid JSON
-                    retry_prompt = user_prompt + "\n\nIMPORTANT: Your previous response was not valid JSON. Please ensure your response is a valid JSON object only, with no additional text."
+                    retry_prompt = (
+                        user_prompt
+                        + "\n\nIMPORTANT: Your previous response was not valid JSON. "
+                        "Please ensure your response is a valid JSON object only, with no additional text."
+                    )
                     
                     response = await self.call_model(
                         model_slug=model_slug,
@@ -437,9 +474,7 @@ class ModelClient:
         logger.info("ModelClient closed")
     
     async def __aenter__(self):
-        """Async context manager entry."""
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
         await self.close()

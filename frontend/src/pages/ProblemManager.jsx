@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plus, Edit2, Trash2, Upload, Eye, EyeOff, FileArchive, FileCode, Download, Github, RefreshCw, CheckCircle2, XCircle, FlaskConical, Clock, MemoryStick } from 'lucide-react';
+import { Plus, Edit2, Trash2, Upload, Eye, EyeOff, FileArchive, FileCode, Download, Github, RefreshCw, CheckCircle2, XCircle, FlaskConical, Clock, MemoryStick, Code, Play } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import toast from 'react-hot-toast';
 import {
@@ -10,11 +10,13 @@ import {
   deleteProblem,
   uploadTests,
   fetchTests,
+  fetchSolutions,
   fetchTestFile,
   importProblems,
   importFromGithub,
   syncTestsFromGithub,
   verifyExampleSolution,
+  verifyExampleSolutionStream,
 } from '../api';
 
 function ProblemManager() {
@@ -25,11 +27,12 @@ function ProblemManager() {
   const [showImportForm, setShowImportForm] = useState(false);
   const [selectedProblem, setSelectedProblem] = useState(null);
   const [tests, setTests] = useState([]);
+  const [solutions, setSolutions] = useState([]);
   const [previewTest, setPreviewTest] = useState(null);
   const [previewContent, setPreviewContent] = useState({ input: null, output: null });
   const [previewLoading, setPreviewLoading] = useState(false);
-  const [verifyResult, setVerifyResult] = useState(null);
-  const [verifying, setVerifying] = useState(false);
+  const [verifyResults, setVerifyResults] = useState({});
+  const [verifyingMap, setVerifyingMap] = useState({});
 
   const [formData, setFormData] = useState({
     name: '',
@@ -156,7 +159,10 @@ function ProblemManager() {
         if (selectedProblem?.id === problemId) {
           const updated = await fetchProblem(problemId);
           setSelectedProblem(updated);
-          loadTests(problemId);
+          await Promise.all([
+            loadTests(problemId),
+            loadSolutions(problemId)
+          ]);
         }
       }, 2000);
     } catch (error) {
@@ -195,6 +201,15 @@ function ProblemManager() {
     }
   };
 
+  const loadSolutions = async (problemId) => {
+    try {
+      const data = await fetchSolutions(problemId);
+      setSolutions(data || []);
+    } catch (error) {
+      toast.error('Failed to load solutions: ' + error.message);
+    }
+  };
+
   // Bug fix: viewProblem now fetches full problem details (list endpoint omits description_md,
   // source_url, tests_downloaded, etc.)
   const viewProblem = async (problem) => {
@@ -203,8 +218,12 @@ function ProblemManager() {
       setSelectedProblem(full);
       setPreviewTest(null);
       setPreviewContent({ input: null, output: null });
-      setVerifyResult(null);
-      await loadTests(problem.id);
+      setVerifyResults({});
+      setVerifyingMap({});
+      await Promise.all([
+        loadTests(problem.id),
+        loadSolutions(problem.id)
+      ]);
     } catch (error) {
       toast.error('Failed to load problem details: ' + error.message);
     }
@@ -241,16 +260,49 @@ function ProblemManager() {
     }
   };
 
-  const handleVerifyExample = async () => {
-    setVerifying(true);
-    setVerifyResult(null);
+  const handleVerifyExample = async (solutionPath) => {
+    setVerifyingMap(prev => ({ ...prev, [solutionPath]: true }));
+    // Initialize empty results so the progress bar shows up
+    setVerifyResults(prev => ({
+      ...prev,
+      [solutionPath]: {
+        solution_file: solutionPath,
+        compile_success: true,
+        test_results: [],
+        tests_passed: 0,
+        tests_total: selectedProblem.test_count || 0,
+        all_passed: false
+      }
+    }));
+
     try {
-      const result = await verifyExampleSolution(selectedProblem.id);
-      setVerifyResult(result);
+      await verifyExampleSolutionStream(selectedProblem.id, solutionPath, (data) => {
+        if (data.type === 'test_result') {
+          setVerifyResults(prev => {
+            const current = prev[solutionPath] || { test_results: [] };
+            const newResults = [...current.test_results, data.result];
+            return {
+              ...prev,
+              [solutionPath]: {
+                ...current,
+                test_results: newResults,
+                tests_passed: newResults.filter(r => r.passed).length,
+              }
+            };
+          });
+        } else if (data.type === 'final') {
+          setVerifyResults(prev => ({
+            ...prev,
+            [solutionPath]: data.result
+          }));
+        } else if (data.type === 'error') {
+          toast.error('Verification error: ' + data.message);
+        }
+      });
     } catch (error) {
       toast.error('Verification failed: ' + error.message);
     } finally {
-      setVerifying(false);
+      setVerifyingMap(prev => ({ ...prev, [solutionPath]: false }));
     }
   };
 
@@ -453,7 +505,19 @@ function ProblemManager() {
                   <div className="flex items-start justify-between">
                     <div>
                       <h3 className="font-semibold">{problem.name}</h3>
-                      <p className="text-sm text-gray-400">{problem.slug}</p>
+                      {problem.short_description && (
+                        <p className="text-xs text-blue-400 mt-1 line-clamp-2">{problem.short_description}</p>
+                      )}
+                      {problem.tags && (
+                        <div className="flex flex-wrap gap-1 mt-2">
+                          {JSON.parse(problem.tags).map((tag, idx) => (
+                            <span key={idx} className="px-1.5 py-0.5 bg-blue-500/10 text-blue-400 rounded text-[10px] border border-blue-500/20">
+                              {tag}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      <p className="text-sm text-gray-400 mt-1">{problem.slug}</p>
                       <div className="flex items-center space-x-4 mt-2 text-xs text-gray-500">
                         <span>{problem.time_limit_ms}ms</span>
                         <span>{problem.memory_limit_mb}MB</span>
@@ -496,21 +560,26 @@ function ProblemManager() {
           <div className="space-y-4">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold">Problem Details</h2>
-              {selectedProblem.tests_downloaded && (
-                <button
-                  onClick={handleVerifyExample}
-                  disabled={verifying}
-                  className="btn-secondary flex items-center space-x-2 text-sm py-1.5"
-                >
-                  <FlaskConical className={`h-4 w-4 ${verifying ? 'animate-pulse text-blue-400' : ''}`} />
-                  <span>{verifying ? 'Verifying...' : 'Verify Example Solution'}</span>
-                </button>
-              )}
             </div>
 
             {/* Description */}
             <div className="card">
               <h3 className="font-medium mb-2">Description</h3>
+              {selectedProblem.short_description && (
+                <div className="mb-4 p-3 bg-blue-500/5 border border-blue-500/10 rounded-lg">
+                  <p className="text-xs font-semibold text-blue-400 uppercase tracking-wider mb-1">Summary</p>
+                  <p className="text-sm text-gray-300 italic">{selectedProblem.short_description}</p>
+                  {selectedProblem.tags && (
+                    <div className="flex flex-wrap gap-1 mt-3">
+                      {JSON.parse(selectedProblem.tags).map((tag, idx) => (
+                        <span key={idx} className="px-2 py-0.5 bg-blue-500/20 text-blue-300 rounded text-[11px] border border-blue-400/30">
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="prose prose-invert prose-sm max-w-none max-h-64 overflow-y-auto">
                 {/* Bug fix: was selectedProblem.description (undefined); now description_md from full fetch */}
                 <ReactMarkdown>{selectedProblem.description_md || 'No description'}</ReactMarkdown>
@@ -553,6 +622,102 @@ function ProblemManager() {
                     <RefreshCw className={`h-4 w-4 ${syncingTests ? 'animate-spin' : ''}`} />
                     <span>{syncingTests ? 'Syncing...' : 'Sync Tests from GitHub'}</span>
                   </button>
+                )}
+              </div>
+            )}
+
+            {/* Solutions List */}
+            {selectedProblem.tests_downloaded && (
+              <div className="card">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="font-medium flex items-center">
+                    <Code className="h-4 w-4 mr-2" />
+                    Available Solutions
+                  </h3>
+                  {solutions.length === 0 && !Object.values(verifyingMap).some(Boolean) && (
+                    <span className="text-xs text-gray-500">No solutions found in repository</span>
+                  )}
+                </div>
+                
+                {solutions.length > 0 && (
+                  <div className="space-y-3">
+                    {solutions.map((sol) => {
+                      const result = verifyResults[sol.path];
+                      const isVerifying = verifyingMap[sol.path];
+
+                      return (
+                        <div key={sol.path} className="space-y-2">
+                          <div className="flex items-center justify-between p-2 bg-gray-950/50 rounded-lg border border-gray-800 hover:border-gray-700 transition-colors">
+                            <div className="flex-1 min-w-0 mr-4">
+                              <div className="text-sm font-medium truncate" title={sol.path}>{sol.name}</div>
+                              <div className="flex items-center space-x-3 mt-1">
+                                {sol.expected_score !== null && (
+                                  <span className="text-[10px] text-gray-500 bg-gray-800 px-1.5 py-0.5 rounded">
+                                    Exp. Score: {sol.expected_score}
+                                  </span>
+                                )}
+                                {sol.expected_verdict && (
+                                  <span className="text-[10px] text-gray-500 bg-gray-800 px-1.5 py-0.5 rounded">
+                                    Exp. Verdict: {sol.expected_verdict}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            <button
+                              onClick={() => handleVerifyExample(sol.path)}
+                              disabled={isVerifying}
+                              className="btn-secondary text-xs py-1 px-3 flex items-center space-x-1"
+                            >
+                              {isVerifying ? (
+                                <FlaskConical className="h-3 w-3 animate-pulse text-blue-400" />
+                              ) : (
+                                <Play className="h-3 w-3" />
+                              )}
+                              <span>Test</span>
+                            </button>
+                          </div>
+                          
+                          {/* Progress Bar */}
+                          {result && result.compile_success && (
+                            <div className="px-1">
+                              <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-gray-800">
+                                {result.test_results && result.test_results.map((t, i) => (
+                                  <div
+                                    key={i}
+                                    className={`h-full border-r border-gray-900 last:border-0 ${
+                                      t.passed ? 'bg-green-500' : 'bg-red-500'
+                                    }`}
+                                    style={{ width: `${100 / (result.tests_total || 1)}%` }}
+                                    title={`Test ${t.test_index}: ${t.verdict}`}
+                                  />
+                                ))}
+                                {isVerifying && result.test_results && result.test_results.length < (result.tests_total || 0) && (
+                                  <div 
+                                    className="h-full bg-blue-500/30 animate-pulse"
+                                    style={{ width: `${100 - (result.test_results.length * 100 / (result.tests_total || 1))}%` }}
+                                  />
+                                )}
+                              </div>
+                              <div className="flex justify-between mt-1 px-0.5">
+                                <span className={`text-[10px] font-medium ${result.all_passed ? 'text-green-400' : 'text-red-400'}`}>
+                                  {result.tests_passed}/{result.tests_total || selectedProblem.test_count} passed
+                                </span>
+                                <span className="text-[10px] text-gray-500">
+                                  {result.tests_total > 0 ? ((result.tests_passed / result.tests_total) * 100).toFixed(0) : 0}%
+                                </span>
+                              </div>
+                            </div>
+                          )}
+
+                          {result && !result.compile_success && (
+                            <div className="px-2 py-1 bg-red-900/20 border border-red-500/30 rounded text-[10px] text-red-400 font-mono">
+                              Compilation Failed
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
                 )}
               </div>
             )}
@@ -611,66 +776,87 @@ function ProblemManager() {
               )}
             </div>
 
-            {/* Verify Example Result */}
-            {verifyResult && (
-              <div className={`card border ${verifyResult.all_passed ? 'border-green-500/30' : 'border-red-500/30'}`}>
+            {/* Verify Example Result Detail (shown when clicking a test result) */}
+            {Object.values(verifyResults).map(res => (
+              <div key={res.solution_file} className={`card border ${res.all_passed ? 'border-green-500/30' : 'border-red-500/30'}`}>
                 <div className="flex items-center justify-between mb-3">
                   <h3 className="font-medium flex items-center space-x-2">
                     <FlaskConical className="h-4 w-4" />
                     <span>Example Solution Verification</span>
                   </h3>
                   <button
-                    onClick={() => setVerifyResult(null)}
+                    onClick={() => setVerifyResults(prev => {
+                      const next = { ...prev };
+                      delete next[res.solution_file];
+                      return next;
+                    })}
                     className="text-gray-500 hover:text-gray-300 text-xs"
                   >
                     <XCircle className="h-4 w-4" />
                   </button>
                 </div>
 
-                <p className="text-xs text-gray-500 font-mono mb-3 truncate" title={verifyResult.solution_file}>
-                  {verifyResult.solution_file}
+                <p className="text-xs text-gray-500 font-mono mb-3 truncate" title={res.solution_file}>
+                  {res.solution_file}
                 </p>
 
-                {!verifyResult.compile_success ? (
+                {!res.compile_success ? (
                   <div>
                     <div className="flex items-center space-x-2 text-red-400 mb-2">
                       <XCircle className="h-4 w-4" />
                       <span className="text-sm font-medium">Compilation Failed</span>
                     </div>
                     <pre className="bg-gray-950 p-3 rounded text-xs font-mono text-red-300 overflow-x-auto max-h-40 whitespace-pre-wrap">
-                      {verifyResult.compile_log}
+                      {res.compile_log}
                     </pre>
                   </div>
                 ) : (
                   <div className="space-y-3">
                     {/* Summary row */}
-                    <div className="flex items-center space-x-4">
-                      <div className={`flex items-center space-x-1.5 text-sm font-medium ${verifyResult.all_passed ? 'text-green-400' : 'text-red-400'}`}>
-                        {verifyResult.all_passed
+                    <div className="flex items-center flex-wrap gap-4">
+                      <div className={`flex items-center space-x-1.5 text-sm font-medium ${res.all_passed ? 'text-green-400' : 'text-red-400'}`}>
+                        {res.all_passed
                           ? <CheckCircle2 className="h-4 w-4" />
                           : <XCircle className="h-4 w-4" />}
-                        <span>{verifyResult.tests_passed}/{verifyResult.tests_total} tests passed</span>
+                        <span>{res.tests_passed}/{res.tests_total} tests passed</span>
                       </div>
-                      {verifyResult.avg_time_ms != null && (
-                        <div className="flex items-center space-x-1 text-xs text-gray-400">
-                          <Clock className="h-3 w-3" />
-                          <span>avg {verifyResult.avg_time_ms.toFixed(1)}ms</span>
-                        </div>
-                      )}
-                      {verifyResult.max_time_ms != null && (
-                        <div className="flex items-center space-x-1 text-xs text-gray-400">
-                          <Clock className="h-3 w-3" />
-                          <span>max {verifyResult.max_time_ms.toFixed(1)}ms</span>
-                        </div>
-                      )}
+
+                      <div className="flex items-center space-x-1.5 text-sm font-bold text-blue-400 bg-blue-400/10 px-2 py-0.5 rounded">
+                        <span>Score: {res.score !== undefined 
+                          ? (typeof res.score === 'number' ? res.score.toFixed(2) : res.score)
+                          : ((res.tests_passed / res.tests_total) * 100).toFixed(2)
+                        }</span>
+                        {solutions.find(s => s.path === res.solution_file)?.expected_score !== null && (
+                          <span className="text-xs text-gray-500 font-normal ml-1">
+                            (Expected: {solutions.find(s => s.path === res.solution_file)?.expected_score})
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center space-x-4">
+                        {res.avg_time_ms != null && (
+                          <div className="flex items-center space-x-1 text-xs text-gray-400">
+                            <Clock className="h-3 w-3" />
+                            <span>avg {res.avg_time_ms < 1 ? res.avg_time_ms.toFixed(2) : res.avg_time_ms.toFixed(1)}ms</span>
+                          </div>
+                        )}
+                        {res.max_time_ms != null && (
+                          <div className="flex items-center space-x-1 text-xs text-gray-400">
+                            <Clock className="h-3 w-3" />
+                            <span>max {res.max_time_ms < 1 ? res.max_time_ms.toFixed(2) : res.max_time_ms.toFixed(1)}ms</span>
+                          </div>
+                        )}
+                      </div>
                     </div>
 
                     {/* Per-test breakdown */}
-                    {verifyResult.test_results.length > 0 && (
+                    {res.test_results.length > 0 && (
                       <div className="max-h-48 overflow-y-auto space-y-1">
-                        {verifyResult.test_results.map((t) => (
-                          <div
-                            key={t.test_index}
+                        {[...res.test_results]
+                          .sort((a, b) => (a.test_index || 0) - (b.test_index || 0))
+                          .map((t) => (
+                            <div
+                              key={t.test_index}
                             className={`flex items-center justify-between px-2 py-1 rounded text-xs ${
                               t.passed ? 'bg-green-900/20 text-green-300' : 'bg-red-900/20 text-red-300'
                             }`}
@@ -687,7 +873,9 @@ function ProblemManager() {
                               }`}>{t.verdict}</span>
                             </div>
                             <div className="flex items-center space-x-3 text-gray-400">
-                              {t.time_ms != null && <span>{t.time_ms.toFixed(1)}ms</span>}
+                              {t.time_ms != null && (
+                                <span>{t.time_ms < 1 ? t.time_ms.toFixed(2) : t.time_ms.toFixed(1)}ms</span>
+                              )}
                               {t.memory_kb != null && <span>{(t.memory_kb / 1024).toFixed(1)}MB</span>}
                               {t.error && <span className="text-red-400 truncate max-w-32" title={t.error}>{t.error}</span>}
                             </div>
@@ -698,7 +886,7 @@ function ProblemManager() {
                   </div>
                 )}
               </div>
-            )}
+            ))}
 
             {/* Test Preview */}
             {/* Bug fix: content is now loaded on demand via fetchTestFile, not expected inline */}

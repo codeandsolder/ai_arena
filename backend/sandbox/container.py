@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 # Default sandbox configuration
-DEFAULT_IMAGE = "arena-sandbox:latest"
+DEFAULT_IMAGE = "arena-sandbox:v2"
 DEFAULT_MEMORY_LIMIT = "512m"  # 512 MB
 DEFAULT_CPU_PERIOD = 100000     # 100ms
 DEFAULT_CPU_QUOTA = 100000      # 100ms = 1 CPU
@@ -52,6 +52,9 @@ class ContainerManager:
     with strict security constraints.
     """
     
+    # Class-level lock for image building to prevent race conditions
+    _image_build_lock: asyncio.Lock = None
+    
     def __init__(self, image: str = DEFAULT_IMAGE):
         """
         Initialize the container manager.
@@ -68,6 +71,61 @@ class ContainerManager:
                 "Install it with: pip install docker"
             )
     
+    async def ensure_image_available(self) -> bool:
+        """
+        Ensure the sandbox image is available locally.
+        
+        If the image is missing, it will be built from the Dockerfile.
+        Uses a class-level lock to prevent race conditions when multiple
+        evaluations try to build the same image simultaneously.
+        
+        Returns:
+            True if image is available or was successfully built
+        """
+        if self.is_image_available(self.image):
+            logger.debug(f"Docker image '{self.image}' is already available")
+            return True
+        
+        # Initialize the class-level lock if needed (must be done in async context)
+        if ContainerManager._image_build_lock is None:
+            ContainerManager._image_build_lock = asyncio.Lock()
+        
+        # Use lock to prevent concurrent builds of the same image
+        async with ContainerManager._image_build_lock:
+            # Double-check after acquiring lock (another process may have built it)
+            if self.is_image_available(self.image):
+                logger.debug(f"Docker image '{self.image}' is already available (after lock)")
+                return True
+            
+            logger.info(f"Docker image '{self.image}' not found. Building...")
+            
+            # Determine paths
+            # Assuming we are in d:/ai_arena/backend/sandbox/container.py
+            # Dockerfile is in d:/ai_arena/docker/Dockerfile.sandbox
+            # We need the context to be the root or the docker directory
+            # If we use d:/ai_arena/docker as context, we need to make sure test_harness.cpp is there
+            
+            base_dir = Path(__file__).parent.parent.parent
+            docker_dir = base_dir / "docker"
+            dockerfile = "Dockerfile.sandbox"
+            
+            if not (docker_dir / dockerfile).exists():
+                logger.error(f"Dockerfile not found at {docker_dir / dockerfile}")
+                return False
+                
+            success = await self.build_image(
+                dockerfile_path=str(docker_dir),
+                dockerfile=dockerfile,
+                tag=self.image
+            )
+            
+            if success:
+                logger.info(f"Successfully built sandbox image '{self.image}'")
+            else:
+                logger.error(f"Failed to build sandbox image '{self.image}'")
+                
+            return success
+
     @property
     def client(self):
         """Get or create Docker client."""
@@ -94,7 +152,8 @@ class ContainerManager:
         tmpfs: Optional[Dict[str, str]] = None,
         working_dir: str = "/workspace",
         user: str = "sandboxuser",
-        environment: Optional[Dict[str, str]] = None
+        environment: Optional[Dict[str, str]] = None,
+        cap_add: Optional[List[str]] = None
     ) -> Any:
         """
         Create a Docker container with security constraints.
@@ -141,6 +200,9 @@ class ContainerManager:
         
         if environment:
             container_config["environment"] = environment
+            
+        if cap_add:
+            container_config["cap_add"] = cap_add
         
         # Remove None values
         container_config = {k: v for k, v in container_config.items() if v is not None}
@@ -150,6 +212,11 @@ class ContainerManager:
         try:
             # Run in thread pool since docker-py is synchronous
             loop = asyncio.get_event_loop()
+            
+            # Ensure image is available before creating container
+            if not self.is_image_available(self.image):
+                await self.ensure_image_available()
+                
             container = await loop.run_in_executor(
                 None,
                 lambda: self.client.containers.run(**container_config)
@@ -281,7 +348,8 @@ class ContainerManager:
         mem_limit: str = DEFAULT_MEMORY_LIMIT,
         cpu_quota: int = DEFAULT_CPU_QUOTA,
         timeout: int = DEFAULT_TIMEOUT,
-        network_disabled: bool = True
+        network_disabled: bool = True,
+        working_dir: Optional[str] = "/workspace"
     ) -> ContainerResult:
         """
         Execute a command in a new container and clean up afterwards.
@@ -351,6 +419,7 @@ class ContainerManager:
         self,
         dockerfile_path: str,
         tag: str,
+        dockerfile: str = "Dockerfile",
         build_args: Optional[Dict[str, str]] = None
     ) -> bool:
         """
@@ -359,6 +428,7 @@ class ContainerManager:
         Args:
             dockerfile_path: Path to directory containing Dockerfile
             tag: Image tag
+            dockerfile: Name of the Dockerfile (relative to dockerfile_path)
             build_args: Build arguments
             
         Returns:
@@ -367,12 +437,13 @@ class ContainerManager:
         try:
             loop = asyncio.get_event_loop()
             
-            logger.info(f"Building Docker image '{tag}' from {dockerfile_path}")
+            logger.info(f"Building Docker image '{tag}' from {dockerfile_path} using {dockerfile}")
             
             result = await loop.run_in_executor(
                 None,
                 lambda: self.client.images.build(
                     path=dockerfile_path,
+                    dockerfile=dockerfile,
                     tag=tag,
                     buildargs=build_args or {},
                     rm=True,

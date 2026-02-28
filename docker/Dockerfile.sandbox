@@ -17,24 +17,26 @@ RUN apt-get update && apt-get install -y \
     time \
     && rm -rf /var/lib/apt/lists/*
 
+# Install task-maker-rust
+RUN mkdir -p /etc/apt/keyrings \
+    && curl https://artifacts.lucaversari.it/signing-key.asc | tee /etc/apt/keyrings/task-maker-rust.asc > /dev/null \
+    && echo "deb [signed-by=/etc/apt/keyrings/task-maker-rust.asc] https://artifacts.lucaversari.it/olimpiadi-informatica/task-maker-rust/latest/deb/noble /" | tee /etc/apt/sources.list.d/task-maker-rust.list \
+    && apt-get update -qq && apt-get install -y -qq task-maker-rust \
+    && ln -s /usr/bin/task-maker-rust /usr/local/bin/tmc || true
+
 # Add LLVM repository for clang versions
 RUN wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc \
     && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-18 main" \
     && add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-17 main"
 
-# Install GCC versions (12, 13, 14)
-RUN apt-get update && apt-get install -y \
-    gcc-12 \
-    g++-12 \
-    gcc-13 \
-    g++-13 \
+# Install GCC 14
+RUN apt-get update -qq && apt-get install -y -qq \
     gcc-14 \
     g++-14 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Clang versions (17, 18)
-RUN apt-get update && apt-get install -y \
-    clang-17 \
+# Install Clang 18
+RUN apt-get update -qq && apt-get install -y -qq \
     clang-18 \
     && rm -rf /var/lib/apt/lists/*
 

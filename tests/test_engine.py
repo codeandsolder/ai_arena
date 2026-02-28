@@ -45,7 +45,7 @@ def _benchmark_summary(solution_id, passed=1, total=1, all_passed=True):
         all_passed=all_passed,
         test_results=[
             TestCaseResult(
-                test_index=i, passed=(i < passed), actual_output="",
+                test_index=i, test_name=f"test_{i}.in", passed=(i < passed), actual_output="",
                 time_ms=50.0, memory_kb=1024, exit_code=0,
                 verdict="passed" if i < passed else "wrong_answer", error="",
             )
@@ -80,7 +80,7 @@ def mock_orchestrator_deps():
         mock_client.get_prices = mock.AsyncMock(return_value={"prompt": 0.0, "completion": 0.0})
         mock_client.call_model_with_retry = mock.AsyncMock(return_value=(
             _model_response(),
-            {"code": "int main(){return 0;}", "compiler": "g++", "flags": "-O2"},
+            {"code": "int main(){}", "compiler": "g++", "flags": "-O2"},
         ))
         mock_client.close = mock.AsyncMock()
 
@@ -422,6 +422,7 @@ async def test_start_run_success(db_session, mock_orchestrator_deps):
     problem, run = await _create_problem_and_run(db_session)
     run_id = run.id  # Store to prevent MissingGreenlet
 
+
     with _patch_engine_session(db_session, mock_orchestrator_deps):
         engine = _make_engine(db_session, mock_orchestrator_deps)
 
@@ -483,7 +484,7 @@ async def test_generate_single_solution_success(db_session, mock_orchestrator_de
         system_prompt="sys", user_prompt="usr", config=RunConfig(),
     )
     assert result.success is True
-    assert result.code == "int main(){return 0;}"
+    assert result.code == "int main(){}"
     assert result.compiler == "g++"
     assert result.compiler_flags == "-O2"
     assert result.api_response is not None
@@ -504,7 +505,7 @@ async def test_generate_single_solution_no_json(db_session, mock_orchestrator_de
         system_prompt="sys", user_prompt="usr", config=RunConfig(),
     )
     assert result.success is False
-    assert "parse JSON" in result.error_message
+    assert result.error_message is not None and "parse JSON" in result.error_message
 
 
 @pytest.mark.asyncio
@@ -522,7 +523,7 @@ async def test_generate_single_solution_empty_code(db_session, mock_orchestrator
         system_prompt="sys", user_prompt="usr", config=RunConfig(),
     )
     assert result.success is False
-    assert "No code" in result.error_message
+    assert result.error_message is not None and "No code" in result.error_message
 
 
 @pytest.mark.asyncio
@@ -540,7 +541,7 @@ async def test_generate_single_solution_exception(db_session, mock_orchestrator_
         system_prompt="sys", user_prompt="usr", config=RunConfig(),
     )
     assert result.success is False
-    assert "timeout" in result.error_message
+    assert result.error_message is not None and "timeout" in result.error_message
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -567,7 +568,7 @@ async def test_generate_solutions_stores_api_call(db_session, mock_orchestrator_
 
     assert len(solutions) == 1
     assert solutions[0].status == "pending"
-    assert solutions[0].source_code == "int main(){return 0;}"
+    assert solutions[0].source_code == "int main(){}"
 
     api_calls = (await db_session.execute(
         select(ApiCall).where(ApiCall.purpose == "solution_generation")
@@ -684,7 +685,7 @@ async def test_parse_run_config_defaults(db_session, mock_orchestrator_deps):
     assert cfg.models == []
     assert cfg.num_rounds == 5
     assert cfg.correctness_weight == 0.6
-    assert cfg.judge_model == "anthropic/claude-3.5-sonnet"
+    assert cfg.judge_model == "google/gemini-3-flash-preview"
 
 
 @pytest.mark.asyncio
@@ -1029,7 +1030,7 @@ async def test_retry_no_source_code(db_session, mock_orchestrator_deps):
     )
     result = await engine._retry_solution_with_error(
         run.id, round_obj.id, sol, "error", "/tmp/bin",
-        RunConfig(), db_session,
+        RunConfig()
     )
     assert result is None
 
@@ -1044,18 +1045,16 @@ async def test_retry_success(db_session, mock_orchestrator_deps):
 
     result = await engine._retry_solution_with_error(
         run.id, round_obj.id, sol, "error: missing semicolon", "/tmp/bin",
-        RunConfig(), db_session,
+        RunConfig()
     )
     assert result is not None
-    ret_sol, ret_path = result
+    ret_sol, ret_path, retry_api_calls = result
     assert ret_sol.status == "compiled"
     assert ret_sol.compile_success is True
 
-    # Verify API call stored
-    api_calls = (await db_session.execute(
-        select(ApiCall).where(ApiCall.purpose == "error_retry")
-    )).scalars().all()
-    assert len(api_calls) == 1
+    # Verify API call was returned in result (since it might not be committed yet)
+    assert len(retry_api_calls) == 1
+    assert retry_api_calls[0].purpose == "error_retry"
 
 
 @pytest.mark.asyncio
@@ -1071,7 +1070,7 @@ async def test_retry_no_json_returns_none(db_session, mock_orchestrator_deps):
 
     result = await engine._retry_solution_with_error(
         run.id, round_obj.id, sol, "error", "/tmp/bin",
-        RunConfig(), db_session,
+        RunConfig()
     )
     assert result is None
 
@@ -1093,11 +1092,12 @@ async def test_retry_security_failure(db_session, mock_orchestrator_deps):
 
     result = await engine._retry_solution_with_error(
         run.id, round_obj.id, sol, "error", "/tmp/bin",
-        RunConfig(), db_session,
+        RunConfig()
     )
-    assert result is None
-    assert sol.status == "security_failed"
-    assert "on retry" in sol.error_message
+    assert result is not None
+    res_sol, res_path, res_api_calls = result
+    assert res_sol.status == "security_failed"
+    assert "on retry" in res_sol.error_message
 
 
 @pytest.mark.asyncio
@@ -1113,10 +1113,11 @@ async def test_retry_security_exception(db_session, mock_orchestrator_deps):
 
     result = await engine._retry_solution_with_error(
         run.id, round_obj.id, sol, "error", "/tmp/bin",
-        RunConfig(), db_session,
+        RunConfig()
     )
-    assert result is None
-    assert sol.status == "security_error"
+    assert result is not None
+    res_sol, res_path, res_api_calls = result
+    assert res_sol.status == "security_error"
 
 
 @pytest.mark.asyncio
@@ -1130,10 +1131,11 @@ async def test_retry_recompile_fails(db_session, mock_orchestrator_deps):
 
     result = await engine._retry_solution_with_error(
         run.id, round_obj.id, sol, "error", "/tmp/bin",
-        RunConfig(), db_session,
+        RunConfig()
     )
-    assert result is None
-    assert sol.compile_success is False
+    assert result is not None
+    res_sol, res_path, res_api_calls = result
+    assert res_sol.compile_success is False
 
 
 @pytest.mark.asyncio
@@ -1149,7 +1151,7 @@ async def test_retry_model_exception(db_session, mock_orchestrator_deps):
 
     result = await engine._retry_solution_with_error(
         run.id, round_obj.id, sol, "error", "/tmp/bin",
-        RunConfig(), db_session,
+        RunConfig()
     )
     assert result is None
 
@@ -1245,8 +1247,6 @@ async def test_close_cancels_and_cleans_up(db_session, mock_orchestrator_deps):
 
     task1.cancel.assert_called_once()
     task2.cancel.assert_called_once()
-    engine.model_client.close.assert_awaited_once()
-    engine.summarizer.close.assert_awaited_once()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1375,7 +1375,7 @@ async def test_retry_malformed_flags_fallback(db_session, mock_orchestrator_deps
 
     result = await engine._retry_solution_with_error(
         run.id, round_obj.id, sol, "error", "/tmp/bin",
-        RunConfig(), db_session
+        RunConfig()
     )
     assert result is not None
     

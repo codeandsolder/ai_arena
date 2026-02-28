@@ -10,6 +10,7 @@ from backend.api.rounds import router as rounds_router
 from backend.api.solutions import router as solutions_router
 from backend.api.api_calls import router as api_calls_router
 from backend.api.websocket import websocket_router
+from .verify_example import router as verify_example_router
 
 __all__ = [
     "problems_router",
@@ -18,4 +19,5 @@ __all__ = [
     "solutions_router",
     "api_calls_router",
     "websocket_router",
+    "verify_example_router",
 ]

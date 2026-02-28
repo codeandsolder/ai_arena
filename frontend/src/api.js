@@ -75,9 +75,54 @@ export const uploadTests = (id, zipFile) => {
 
 export const fetchTests = (id) => apiRequest(`/problems/${id}/tests`);
 
-export const verifyExampleSolution = (id) => apiRequest(`/problems/${id}/verify-example`, {
+export const fetchSolutions = (id) => apiRequest(`/problems/${id}/solutions`);
+
+export const verifyExampleSolution = (id, solutionPath) => apiRequest(`/problems/${id}/verify-example`, {
   method: 'POST',
+  body: solutionPath ? { solution_path: solutionPath } : {},
 });
+
+export const verifyExampleSolutionStream = async (id, solutionPath, onUpdate) => {
+  const url = `${BASE_URL}/problems/${id}/verify-example-stream`;
+  const body = solutionPath ? { solution_path: solutionPath } : {};
+  
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop(); // Keep partial line in buffer
+
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        try {
+          const data = JSON.parse(line.substring(6));
+          onUpdate(data);
+        } catch (e) {
+          console.error('Failed to parse SSE data', e, line);
+        }
+      }
+    }
+  }
+};
 
 export const fetchTestFile = (problemId, filename) => {
   return fetch(`${BASE_URL}/problems/${problemId}/tests/${filename}`).then(async (res) => {
@@ -88,6 +133,8 @@ export const fetchTestFile = (problemId, filename) => {
     return res.text();
   });
 };
+
+export const fetchStatus = () => apiRequest('/status');
 
 // Run API
 export const fetchRuns = () => apiRequest('/runs/');
@@ -201,9 +248,11 @@ export default {
   // Solutions
   fetchSolution,
   fetchSolutionTests,
-  // API Calls
+    // API Calls
   fetchApiCalls,
   fetchApiCall,
+  // Status
+  fetchStatus,
   // WebSocket
   createWebSocket,
 };

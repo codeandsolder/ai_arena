@@ -1,9 +1,12 @@
+import json
 import pytest
 import unittest.mock as mock
 import os
 import shutil
 import json
 import hashlib
+import gzip
+import re
 from pathlib import Path
 from backend.services.problem_ingestion import IOIIngestor
 from backend.database.models import Problem, Run

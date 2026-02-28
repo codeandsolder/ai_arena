@@ -17,6 +17,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pymupdf4llm",
     "pymupdf-layout>=1.27.1",
+    "pyyaml>=6.0.3",
 ]
 
 [project.optional-dependencies]
@@ -36,10 +37,15 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.7.0",
     "aiohttp>=3.13.3",
+    "pytest-cov>=7.0.0",
 ]
 
 [project.scripts]
 arena = "backend.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["backend"]
@@ -47,23 +53,71 @@ packages = ["backend"]
 [tool.uv]
 default-groups = ["dev"]
 
+# ---------------------------------------------------------------------------
+# Formatting & linting
+# ---------------------------------------------------------------------------
+
 [tool.black]
 line-length = 100
-target-version = ['py310']
+target-version = ["py310"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]   # pycodestyle, pyflakes, isort, pyupgrade
+ignore = ["E501"]                 # line length is handled by black
+
+[tool.ruff.lint.isort]
+known-first-party = ["backend"]
+
+# ---------------------------------------------------------------------------
+# Type checking
+# ---------------------------------------------------------------------------
 
 [tool.mypy]
 python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+ignore_missing_imports = true     # avoids noise from untyped third-party libs
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = [
+    "--cov=backend",
+    "--cov-report=term-missing",
+    "--cov-report=xml:coverage/coverage.xml",
+    "--cov-report=html:coverage/html",
+    "-v",
+]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[tool.coverage.run]
+source = ["backend"]
+branch = true                     # measure branch coverage, not just line coverage
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 70                    # set to e.g. 80 to enforce a minimum threshold
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "pass",
+    "raise ImportError",
+]
+
+[tool.coverage.html]
+directory = "coverage/html"
+title = "AI Optimization Arena – Coverage Report"
+show_contexts = true              # shows which tests covered each line

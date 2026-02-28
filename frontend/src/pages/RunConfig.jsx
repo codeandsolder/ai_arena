@@ -98,9 +98,9 @@ function RunConfig() {
   const [formData, setFormData] = useState({
     name: '',
     problem_id: '',
-    models: [{ ...DEFAULT_MODEL_CONFIG }],
+    models: [{ ...DEFAULT_MODEL_CONFIG, slug: localStorage.getItem('defaultRunModel') || '' }],
     judge_model: { ...DEFAULT_MODEL_CONFIG },
-    prompts: { ...DEFAULT_PROMPTS },
+    prompts: { ...DEFAULT_PROMPTS, system: localStorage.getItem('defaultRunPrompt') || DEFAULT_PROMPTS.system },
     scoring_weights: {
       correctness_weight: 0.5,
       speed_weight: 0.3,
@@ -171,7 +171,7 @@ function RunConfig() {
   const addModel = () => {
     setFormData(prev => ({
       ...prev,
-      models: [...prev.models, { ...DEFAULT_MODEL_CONFIG }],
+      models: [...prev.models, { ...DEFAULT_MODEL_CONFIG, slug: localStorage.getItem('defaultRunModel') || '' }],
     }));
   };
 
@@ -365,7 +365,7 @@ function RunConfig() {
                         value={model.slug}
                         onChange={(e) => updateModel(index, 'slug', e.target.value)}
                         className="input text-sm"
-                        placeholder="anthropic/claude-sonnet-4"
+                        placeholder="google/gemini-3-flash-preview"
                         required
                       />
                       <datalist id="model-suggestions">
@@ -441,7 +441,7 @@ function RunConfig() {
                     value={formData.judge_model.slug}
                     onChange={(e) => updateJudgeModel('slug', e.target.value)}
                     className="input text-sm"
-                    placeholder="anthropic/claude-sonnet-4"
+                    placeholder="google/gemini-3-flash-preview"
                   />
                 </div>
                 <div>

@@ -282,9 +282,9 @@ class BackendAPITester:
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             config = {
                 "models": [
-                    {"slug": "anthropic/claude-3.5-sonnet", "enabled": True, "temperature": 0.7, "max_tokens": 4096}
+                    {"slug": "google/gemini-3-flash-preview", "enabled": True, "temperature": 0.7, "max_tokens": 4096}
                 ],
-                "judge_model": {"slug": "anthropic/claude-3.5-sonnet", "temperature": 0.5, "max_tokens": 2048},
+                "judge_model": {"slug": "google/gemini-3-flash-preview", "temperature": 0.5, "max_tokens": 2048},
                 "prompts": {
                     "system_prompt": "You are a competitive programmer.",
                 },

@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import pymupdf4llm
 from backend import config
 from backend.database.models import Problem
+from backend.utils.task_yaml import parse_task_yaml
 from backend.database.session import AsyncSessionLocal
 from backend.api.problems import get_problem_tests_dir
 
@@ -215,6 +216,31 @@ class IOIIngestor:
             logger.error(f"Error executing git lfs pull: {e}")
             return False
 
+    def _extract_competition(self, repo_name: str, path: str) -> Optional[str]:
+        """Extract competition name from repo name or path (e.g. ioi2023)."""
+        # Try path first (e.g., ioi2023-soccer or ioi2023/soccer)
+        if path:
+            parts = path.strip("/").split("/")
+            # Check the problem directory name itself
+            last_part = parts[-1]
+            match = re.match(r"^([a-zA-Z]+\d{4})", last_part)
+            if match:
+                return match.group(1).upper()
+
+            # If path has multiple parts, check the immediate parent
+            if len(parts) > 1:
+                parent = parts[-2]
+                match = re.match(r"^([a-zA-Z]+\d{4})", parent)
+                if match:
+                    return match.group(1).upper()
+
+        # Try repo name as fallback
+        match = re.match(r"^([a-zA-Z]+\d{4})", repo_name)
+        if match:
+            return match.group(1).upper()
+
+        return None
+
     async def ingest_from_github(self, github_url: str, force_sync: bool = False) -> Optional[Problem]:
         """Fetch, parse, and store a problem from GitHub."""
         logger.info(f"Ingesting from GitHub: {github_url}")
@@ -239,30 +265,50 @@ class IOIIngestor:
 
         contents = await self.fetch_contents(parsed["owner"], parsed["repo"], parsed["path"], parsed["ref"])
 
+        # Check for task.yaml
+        task_config = None
+        if config.PROBLEMS_REPO_DIR.exists():
+            local_dir = config.PROBLEMS_REPO_DIR / parsed["path"]
+            if local_dir.exists():
+                task_config = parse_task_yaml(local_dir)
+
         # Find the statement (PDF or MD)
         pdf_url = None
         pdf_name = None
         statement_md_url = None
 
-        for item in contents:
-            if item["type"] == "file":
-                if item["name"].lower().endswith(".pdf"):
-                    if not pdf_url or "en" in item["name"].lower():
-                        pdf_url = item["download_url"]
-                        pdf_name = item["name"]
-                elif item["name"].lower() == "statement.md":
-                    statement_md_url = item["download_url"]
+        # If task.yaml specifies a statement, prioritize it
+        if task_config:
+            statement_path = task_config.get_statement_file("en")
+            if statement_path and statement_path.exists():
+                rel_path = str(statement_path.relative_to(config.PROBLEMS_REPO_DIR)).replace("\\", "/")
+                if rel_path.lower().endswith(".pdf"):
+                    pdf_url = f"local://{rel_path}"
+                    pdf_name = statement_path.name
+                elif rel_path.lower().endswith(".md"):
+                    statement_md_url = f"local://{rel_path}"
 
-            if item["type"] == "dir" and item["name"].lower() == "statement":
-                stmt_contents = await self.fetch_contents(parsed["owner"], parsed["repo"], item["path"], parsed["ref"])
-                for s_item in stmt_contents:
-                    if s_item["type"] == "file":
-                        if s_item["name"].lower().endswith(".pdf"):
-                            if not pdf_url or "en" in s_item["name"].lower():
-                                pdf_url = s_item["download_url"]
-                                pdf_name = s_item["name"]
-                        elif s_item["name"].lower() == "statement.md":
-                            statement_md_url = s_item["download_url"]
+        # If not found via task.yaml, use default search logic
+        if not pdf_url and not statement_md_url:
+            for item in contents:
+                if item["type"] == "file":
+                    if item["name"].lower().endswith(".pdf"):
+                        if not pdf_url or "en" in item["name"].lower():
+                            pdf_url = item["download_url"]
+                            pdf_name = item["name"]
+                    elif item["name"].lower() == "statement.md":
+                        statement_md_url = item["download_url"]
+
+                if item["type"] == "dir" and item["name"].lower() == "statement":
+                    stmt_contents = await self.fetch_contents(parsed["owner"], parsed["repo"], item["path"], parsed["ref"])
+                    for s_item in stmt_contents:
+                        if s_item["type"] == "file":
+                            if s_item["name"].lower().endswith(".pdf"):
+                                if not pdf_url or "en" in s_item["name"].lower():
+                                    pdf_url = s_item["download_url"]
+                                    pdf_name = s_item["name"]
+                            elif s_item["name"].lower() == "statement.md":
+                                statement_md_url = s_item["download_url"]
 
         description_md = ""
         if statement_md_url:
@@ -309,7 +355,16 @@ class IOIIngestor:
             return None
 
         # Create/update problem record
-        problem_name = (pdf_name or "Unknown Problem").replace(".pdf", "").replace("-", " ").title()
+        long_name = task_config.long_name if task_config else None
+        if not long_name:
+            long_name = (pdf_name or "Unknown Problem").replace(".pdf", "").replace("-", " ").title()
+
+        competition = self._extract_competition(parsed["repo"], parsed["path"])
+        if competition:
+            problem_name = f"{competition}: {long_name}"
+        else:
+            problem_name = long_name
+
         slug = self._generate_slug(problem_name)
 
         result = await self.session.execute(select(Problem).where(Problem.slug == slug))

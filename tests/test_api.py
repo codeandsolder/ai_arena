@@ -309,22 +309,6 @@ async def test_run_nonexistent_problem(client):
 # Verify Example Solution endpoint
 # =============================================================================
 
-# Helper to skip a verify test if the router isn't wired into the test app yet.
-# The endpoint returns 404 for a valid problem if the route doesn't exist at all,
-# which is indistinguishable from a missing problem — so we probe with a sentinel
-# problem_id that should never exist and check whether the route itself is present.
-async def _verify_route_available(client) -> bool:
-    r = await client.post("/api/v1/problems/999999/verify-example")
-    # 404 with "not found" detail means route exists but problem doesn't
-    # 404 with no detail / routing 404 means route itself is missing
-    if r.status_code == 404:
-        try:
-            detail = r.json().get("detail", "")
-            return "not found" in detail.lower() or "999999" in detail
-        except Exception:
-            return False
-    return True
-
 
 @pytest.mark.asyncio
 async def test_verify_example_not_found(client):
@@ -336,9 +320,6 @@ async def test_verify_example_not_found(client):
 @pytest.mark.asyncio
 async def test_verify_example_no_source_url(client, db_session):
     """Problem without source_url returns 400."""
-    if not await _verify_route_available(client):
-        pytest.skip("verify-example router not registered in test app")
-
     problem = Problem(
         name="No Source",
         slug="no-source-url",
@@ -358,9 +339,6 @@ async def test_verify_example_no_source_url(client, db_session):
 @pytest.mark.asyncio
 async def test_verify_example_tests_not_downloaded(client, db_session):
     """Problem with tests_downloaded=False returns 400."""
-    if not await _verify_route_available(client):
-        pytest.skip("verify-example router not registered in test app")
-
     problem = Problem(
         name="No Tests",
         slug="no-tests-downloaded",
@@ -382,8 +360,6 @@ async def test_verify_example_tests_not_downloaded(client, db_session):
 @patch("backend.sandbox.benchmark.compile_and_benchmark")
 async def test_verify_example_compile_failure(mock_cab, client, setup_problem_with_tests):
     """When compilation fails the response still returns 200 with compile_success=False."""
-    if not await _verify_route_available(client):
-        pytest.skip("verify-example router not registered in test app")
     mock_cab.return_value = (False, "error: missing semicolon", None)
     problem = setup_problem_with_tests
 
@@ -400,8 +376,6 @@ async def test_verify_example_compile_failure(mock_cab, client, setup_problem_wi
 @patch("backend.sandbox.benchmark.compile_and_benchmark")
 async def test_verify_example_all_pass(mock_cab, client, setup_problem_with_tests):
     """Successful verification returns correct aggregated results."""
-    if not await _verify_route_available(client):
-        pytest.skip("verify-example router not registered in test app")
     from backend.sandbox.benchmark import BenchmarkSummary, TestCaseResult
 
     mock_summary = BenchmarkSummary(
@@ -413,8 +387,8 @@ async def test_verify_example_all_pass(mock_cab, client, setup_problem_with_test
         max_memory_kb=8192,
         all_passed=True,
         test_results=[
-            TestCaseResult(test_index=1, passed=True, actual_output="1", time_ms=40.0, memory_kb=4096, exit_code=0, error="", verdict="AC"),
-            TestCaseResult(test_index=2, passed=True, actual_output="2", time_ms=50.4, memory_kb=8192, exit_code=0, error="", verdict="AC"),
+            TestCaseResult(test_index=1, test_name="1.in", passed=True, actual_output="1", time_ms=40.0, memory_kb=4096, exit_code=0, error="", verdict="AC"),
+            TestCaseResult(test_index=2, test_name="2.in", passed=True, actual_output="2", time_ms=50.4, memory_kb=8192, exit_code=0, error="", verdict="AC"),
         ],
     )
     mock_cab.return_value = (True, "Compilation and benchmarking successful", mock_summary)
@@ -438,8 +412,6 @@ async def test_verify_example_all_pass(mock_cab, client, setup_problem_with_test
 @patch("backend.sandbox.benchmark.compile_and_benchmark")
 async def test_verify_example_partial_pass(mock_cab, client, setup_problem_with_tests):
     """Partial pass sets all_passed=False and reports per-test verdicts."""
-    if not await _verify_route_available(client):
-        pytest.skip("verify-example router not registered in test app")
     from backend.sandbox.benchmark import BenchmarkSummary, TestCaseResult
 
     mock_summary = BenchmarkSummary(
@@ -451,8 +423,8 @@ async def test_verify_example_partial_pass(mock_cab, client, setup_problem_with_
         max_memory_kb=4096,
         all_passed=False,
         test_results=[
-            TestCaseResult(test_index=1, passed=True,  actual_output="1", time_ms=40.0, memory_kb=4096, exit_code=0,  error="",                  verdict="AC"),
-            TestCaseResult(test_index=2, passed=False, actual_output="",  time_ms=0.0,  memory_kb=0,    exit_code=-1, error="Time limit exceeded", verdict="TLE"),
+            TestCaseResult(test_index=1, test_name="1.in", passed=True,  actual_output="1", time_ms=40.0, memory_kb=4096, exit_code=0,  error="",                  verdict="AC"),
+            TestCaseResult(test_index=2, test_name="2.in", passed=False, actual_output="",  time_ms=0.0,  memory_kb=0,    exit_code=-1, error="Time limit exceeded", verdict="TLE"),
         ],
     )
     mock_cab.return_value = (True, "ok", mock_summary)

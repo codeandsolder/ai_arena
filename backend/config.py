@@ -26,11 +26,21 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 # Default run configuration
 DEFAULT_MODELS = [
-    "anthropic/claude-3.5-sonnet",
-    "anthropic/claude-3-opus",
-    "openai/gpt-4o",
-    "google/gemini-1.5-pro",
-    "meta-llama/llama-3.1-70b-instruct",
+  'anthropic/claude-3.5-haiku',
+    'nvidia/nemotron-3-nano-30b-a3b:free',
+    'openai/gpt-oss-120b:free',
+    'qwen/qwen3.5-397b-a17b',
+    'minimax/minimax-m2.5',
+    'x-ai/grok-4.1-fast',
+    'z-ai/glm-5:nitro',
+    'stepfun/step-3.5-flash:free',
+    'mistralai/mistral-nemo',
+    'openai/gpt-5-nano',
+    'moonshotai/kimi-k2.5:free',
+    'qwen/qwen3-coder',
+    'qwen/qwen3-next-80b-a3b-instruct:free',
+    'cognitivecomputations/dolphin-mistral-24b-venice-edition:free',
+    'google/gemini-3-flash-preview',
 ]
 
 DEFAULT_MAX_ROUNDS = 5

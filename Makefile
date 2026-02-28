@@ -1,4 +1,5 @@
 .PHONY: test
 
 test:
-	pytest tests/ -v
+	pytest tests/ -v --cov=backend --cov-report=term-missing --cov-report=xml
+

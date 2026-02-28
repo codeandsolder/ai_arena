@@ -41,6 +41,8 @@ class Problem(Base):
     sample_output = Column(Text, nullable=True)
     scoring_mode = Column(String, default="binary", nullable=False)
     source_url = Column(String, nullable=True)
+    short_description = Column(String, nullable=True)
+    tags = Column(Text, nullable=True)  # JSON-encoded string array
     last_synced_at = Column(DateTime, nullable=True)
     tests_downloaded = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)

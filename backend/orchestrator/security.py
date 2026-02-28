@@ -48,7 +48,7 @@ class SecurityAnalyzer:
         self.model_client = model_client
         # Default to a fast, capable model if none provided
         # using a widely available model as default
-        self.security_models = security_models or ["anthropic/claude-3-haiku"]
+        self.security_models = security_models or ["google/gemini-3-flash-preview"]
         self.prompt_formatter = PromptFormatter()
         
     async def analyze_solution(

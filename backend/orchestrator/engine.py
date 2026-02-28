@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,11 +26,13 @@ from backend.orchestrator.security import SecurityAnalyzer
 from backend.database.models import Run, Round, Solution, ApiCall, Problem, TestResult
 from backend.database.session import get_session_maker
 from backend.sandbox.compiler import compile_solution
-from backend.sandbox.benchmark import benchmark_solution, BenchmarkSummary
-from backend.config import DATA_DIR, RUNS_DIR
+from backend.sandbox.benchmark import benchmark_solution, compile_and_benchmark, BenchmarkSummary
+from backend.config import DATA_DIR, RUNS_DIR, PROBLEMS_REPO_DIR
 from backend.websocket_manager import get_websocket_manager, WebSocketManager
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_JUDGE_MODEL = "google/gemini-3-flash-preview"
 
 
 @dataclass
@@ -48,8 +51,8 @@ class RunConfig:
     penalty_wrong_answer: float = -0.5
     allow_error_retry: bool = True
     max_error_retries: int = 2
-    judge_model: str = "anthropic/claude-3.5-sonnet"
-    security_models: List[str] = field(default_factory=lambda: ["anthropic/claude-3-haiku"])
+    judge_model: str = DEFAULT_JUDGE_MODEL
+    security_models: List[str] = field(default_factory=lambda: ["google/gemini-3-flash-preview"])
 
 
 @dataclass
@@ -104,7 +107,10 @@ class OrchestrationEngine:
             websocket_manager: WebSocketManager for status broadcasts
         """
         self.model_client = model_client or ModelClient()
-        self.summarizer = summarizer
+        self.summarizer = summarizer or Summarizer(
+            model_client=self.model_client,
+            judge_model=DEFAULT_JUDGE_MODEL
+        )
         self.prompt_formatter = PromptFormatter()
         self.websocket_manager = websocket_manager or get_websocket_manager()
         self.security_analyzer = SecurityAnalyzer(self.model_client)
@@ -186,13 +192,9 @@ class OrchestrationEngine:
             # Update run status
             await self._update_run_status(run_id, "running", db_session)
             
-            # Initialize summarizer if needed
-            if not self.summarizer:
-                self.summarizer = Summarizer(
-                    model_client=self.model_client,
-                    judge_model=config.judge_model
-                )
-            
+            if self.summarizer and config.judge_model != self.summarizer.judge_model:
+                self.summarizer.judge_model = config.judge_model
+
             # Phase 0: Lazy Download Tests if needed
             if not problem.tests_downloaded:
                 logger.info(f"Tests not downloaded for problem {problem.id}. Downloading now...")
@@ -473,15 +475,21 @@ class OrchestrationEngine:
                 score=0.0
             )
             db_session.add(solution)
-            await db_session.flush()  # Get ID
             solutions.append(solution)
             
+        try:
+            await db_session.flush()
+        except Exception as e:
+            logger.error(f"Failed to flush solutions: {e}")
+            raise
+
+        for solution in solutions:
             # Create generation task
             task = self._generate_single_solution(
                 run_id=run_id,
                 round_id=round_id,
                 solution_id=solution.id,
-                model_slug=model_slug,
+                model_slug=solution.model_slug,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 config=config
@@ -492,7 +500,7 @@ class OrchestrationEngine:
             await self.websocket_manager.broadcast_solution_status(
                 run_id=run_id,
                 solution_id=solution.id,
-                model=model_slug,
+                model=solution.model_slug,
                 status="generating"
             )
         
@@ -646,6 +654,45 @@ class OrchestrationEngine:
         Returns:
             List of (Solution, binary_path) tuples for successful compilations
         """
+        # Load problem to find grader files
+        from backend.database.models import Run, Problem
+        run_result = await db_session.execute(select(Run).where(Run.id == run_id))
+        run = run_result.scalar_one_or_none()
+        problem = None
+        additional_files = {}
+        
+        if run:
+            problem_result = await db_session.execute(select(Problem).where(Problem.id == run.problem_id))
+            problem = problem_result.scalar_one_or_none()
+            
+        if problem and problem.source_url:
+            try:
+                from backend.api.verify_example import _parse_github_url
+                from backend.config import PROBLEMS_REPO_DIR
+                from backend.utils.task_yaml import parse_task_yaml
+                
+                parsed = _parse_github_url(problem.source_url)
+                problem_local_path = PROBLEMS_REPO_DIR / parsed["path"]
+                
+                # Use task.yaml if it exists, otherwise fall back to grader/ directory
+                task_config = parse_task_yaml(problem_local_path)
+                if task_config:
+                    grader_files = task_config.get_grader_files()
+                    for f in grader_files:
+                        if f.is_file():
+                            additional_files[f.name] = f.read_text(encoding="utf-8")
+                    logger.info(f"Found {len(additional_files)} grader files from task.yaml for problem {problem.id}")
+                else:
+                    # Legacy fallback
+                    grader_dir = problem_local_path / "grader"
+                    if grader_dir.is_dir():
+                        for f in grader_dir.glob("*"):
+                            if f.is_file():
+                                additional_files[f.name] = f.read_text(encoding="utf-8")
+                        logger.info(f"Found {len(additional_files)} grader files from grader/ directory for problem {problem.id}")
+            except Exception as e:
+                logger.warning(f"Failed to load grader files for problem: {e}")
+
         # Create run directory for binaries
         run_dir = RUNS_DIR / str(run_id) / f"round_{round_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -656,8 +703,9 @@ class OrchestrationEngine:
 
         compiled = []
         
-        async def compile_with_retry(solution: Solution) -> Tuple[Solution, Optional[str]]:
+        async def compile_with_retry(solution: Solution) -> Tuple[Solution, Optional[str], List[ApiCall]]:
             """Compile a solution with optional retry on error."""
+            api_calls_to_add = []
             binary_path = str(run_dir / f"solution_{solution.id}")
             
             await self.websocket_manager.broadcast_solution_status(
@@ -693,7 +741,7 @@ class OrchestrationEngine:
                         cost_usd=response.cost_usd,
                         latency_ms=response.latency_ms
                     )
-                    db_session.add(api_call)
+                    api_calls_to_add.append(api_call)
                 
                 if not security_result.is_safe:
                     solution.status = "security_failed"
@@ -706,14 +754,14 @@ class OrchestrationEngine:
                         model=solution.model_slug,
                         status="security_failed"
                     )
-                    return solution, None
+                    return solution, None, api_calls_to_add
 
             except Exception as e:
                 logger.error(f"Security analysis error for solution {solution.id}: {e}")
                 # Fail safe? Or allow retry? Let's fail safe.
                 solution.status = "security_error"
                 solution.error_message = f"Security analysis failed: {e}"
-                return solution, None
+                return solution, None, api_calls_to_add
 
             await self.websocket_manager.broadcast_solution_status(
                 run_id=run_id,
@@ -723,20 +771,19 @@ class OrchestrationEngine:
             )
             
             # Parse flags
-            import shlex
             try:
                 flags_list = shlex.split(solution.compiler_flags or "-O2 -std=c++20")
             except ValueError:
                 flags_list = ["-O2", "-std=c++20"]
             
             # Try compilation (skip_safety_check=True because we just did it)
-            # Note: I need to update compile_solution to accept skip_safety_check
             success, stdout, stderr, output_path = await compile_solution(
                 source_code=solution.source_code or "",
                 compiler=solution.compiler or "g++-14",
                 flags=flags_list,
                 output_path=binary_path,
-                skip_safety_check=True
+                skip_safety_check=True,
+                additional_files=additional_files
             )
             
             # Update solution
@@ -751,7 +798,7 @@ class OrchestrationEngine:
                     model=solution.model_slug,
                     status="compiled"
                 )
-                return solution, output_path
+                return solution, output_path, api_calls_to_add
             else:
                 # Check for retry
                 if config.allow_error_retry and config.max_error_retries > 0:
@@ -762,11 +809,19 @@ class OrchestrationEngine:
                         solution=solution,
                         error_details=f"Compilation failed:\n{stderr}",
                         binary_path=binary_path,
-                        config=config,
-                        db_session=db_session
+                        config=config
                     )
                     if retry_result:
-                        return retry_result
+                        ret_solution, ret_path, ret_api_calls = retry_result
+                        api_calls_to_add.extend(ret_api_calls)
+                        if not ret_path:
+                            await self.websocket_manager.broadcast_solution_status(
+                                run_id=run_id,
+                                solution_id=solution.id,
+                                model=solution.model_slug,
+                                status=solution.status
+                            )
+                        return ret_solution, ret_path, api_calls_to_add
                 
                 solution.status = "compile_failed"
                 solution.error_message = f"Compilation failed:\n{stderr[:500]}"
@@ -778,16 +833,21 @@ class OrchestrationEngine:
                     model=solution.model_slug,
                     status="compile_failed"
                 )
-                return solution, None
+                return solution, None, api_calls_to_add
         
         # Compile all solutions in parallel
         tasks = [compile_with_retry(sol) for sol in solutions]
         results = await asyncio.gather(*tasks)
         
+        # Add all api calls to session
+        for _, _, api_calls in results:
+            for api_call in api_calls:
+                db_session.add(api_call)
+                
         await db_session.commit()
         
         # Filter successful compilations
-        for solution, binary_path in results:
+        for solution, binary_path, _ in results:
             if binary_path:
                 compiled.append((solution, binary_path))
         
@@ -800,9 +860,8 @@ class OrchestrationEngine:
         solution: Solution,
         error_details: str,
         binary_path: str,
-        config: RunConfig,
-        db_session: AsyncSession
-    ) -> Optional[Tuple[Solution, str]]:
+        config: RunConfig
+    ) -> Optional[Tuple[Solution, Optional[str], List[ApiCall]]]:
         """
         Retry a solution generation after compilation error.
         
@@ -813,11 +872,11 @@ class OrchestrationEngine:
             error_details: Error message from compilation
             binary_path: Path for compiled binary
             config: Run configuration
-            db_session: Database session
             
         Returns:
-            (Solution, binary_path) if retry successful, None otherwise
+            (Solution, binary_path, api_calls) if retry successful, None otherwise
         """
+        api_calls_to_add = []
         if not solution.source_code:
             return None
         
@@ -860,7 +919,7 @@ class OrchestrationEngine:
                     cost_usd=response.cost_usd,
                     latency_ms=response.latency_ms
                 )
-                db_session.add(api_call)
+                api_calls_to_add.append(api_call)
                 
                 # Security Analysis for retried solution
                 try:
@@ -888,21 +947,20 @@ class OrchestrationEngine:
                             cost_usd=sec_response.cost_usd,
                             latency_ms=sec_response.latency_ms
                         )
-                        db_session.add(sec_api_call)
+                        api_calls_to_add.append(sec_api_call)
 
                     if not security_result.is_safe:
                         solution.status = "security_failed"
                         solution.error_message = f"Security Check Failed (on retry):\n{security_result.details}"
                         logger.warning(f"Retried solution {solution.id} failed security check")
-                        return None
+                        return solution, None, api_calls_to_add
                 except Exception as e:
                     logger.error(f"Security analysis error on retry for solution {solution.id}: {e}")
                     solution.status = "security_error"
                     solution.error_message = f"Security analysis failed on retry: {e}"
-                    return None
+                    return solution, None, api_calls_to_add
 
                 # Retry compilation
-                import shlex
                 try:
                     flags_list = shlex.split(solution.compiler_flags or "-O2 -std=c++20")
                 except ValueError:
@@ -922,13 +980,39 @@ class OrchestrationEngine:
                 
                 if success:
                     solution.status = "compiled"
-                    return solution, output_path
+                    return solution, output_path, api_calls_to_add
+                else:
+                    solution.status = "compile_failed"
+                    solution.error_message = f"Compilation failed on retry:\n{stderr[:500]}"
+                    return solution, None, api_calls_to_add
                 
         except Exception as e:
             logger.error(f"Error retry failed for solution {solution.id}: {e}")
         
         return None
     
+    def _get_problem_dir(self, problem: Problem) -> Optional[str]:
+        """Get the local problem directory from its source URL."""
+        if not problem.source_url:
+            return None
+            
+        import re
+        url = problem.source_url
+        # Simple parser logic duplicated from IOIIngestor
+        repo_only = re.match(r"https://github\.com/([^/]+)/([^/]+)/?$", url)
+        if repo_only:
+            path = ""
+        else:
+            m = re.match(r"https://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/(.*)", url)
+            if not m:
+                m = re.match(r"https://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)", url)
+            if not m:
+                return None
+            path = m.group(4)
+            
+        problem_dir = PROBLEMS_REPO_DIR / path
+        return str(problem_dir) if problem_dir.is_dir() else None
+
     async def _benchmark_solutions(
         self,
         run_id: int,
@@ -949,6 +1033,8 @@ class OrchestrationEngine:
             problem: The problem
             db_session: Database session
         """
+        problem_dir = self._get_problem_dir(problem)
+
         async def benchmark_single(solution: Solution, binary_path: str):
             """Benchmark a single solution."""
             await self.websocket_manager.broadcast_solution_status(
@@ -959,14 +1045,43 @@ class OrchestrationEngine:
             )
             
             try:
-                summary = await benchmark_solution(
-                    solution_id=solution.id,
-                    solution_binary_path=binary_path,
-                    test_cases_dir=test_cases_dir,
-                    time_limit_ms=problem.time_limit_ms,
-                    memory_limit_mb=problem.memory_limit_mb,
-                    db_session=db_session
-                )
+                # Check if task.yaml exists in problem_dir
+                use_tmc = False
+                if problem_dir and os.path.exists(os.path.join(problem_dir, "task.yaml")):
+                    use_tmc = True
+                
+                if use_tmc:
+                    # Parse flags
+                    import shlex
+                    try:
+                        flags_list = shlex.split(solution.compiler_flags or "-O2 -std=c++20")
+                    except ValueError:
+                        flags_list = ["-O2", "-std=c++20"]
+
+                    # Use compile_and_benchmark which handles TMC
+                    success, message, summary = await compile_and_benchmark(
+                        solution_id=solution.id,
+                        source_code=solution.source_code or "",
+                        compiler=solution.compiler or "g++-14",
+                        compiler_flags=flags_list,
+                        test_cases_dir=test_cases_dir,
+                        problem_id=problem.id,
+                        time_limit_ms=problem.time_limit_ms,
+                        memory_limit_mb=problem.memory_limit_mb,
+                        db_session=db_session,
+                        problem_dir=problem_dir
+                    )
+                    if not success or not summary:
+                        raise Exception(f"TMC evaluation failed: {message}")
+                else:
+                    summary = await benchmark_solution(
+                        solution_id=solution.id,
+                        solution_binary_path=binary_path,
+                        test_cases_dir=test_cases_dir,
+                        time_limit_ms=problem.time_limit_ms,
+                        memory_limit_mb=problem.memory_limit_mb,
+                        db_session=db_session
+                    )
                 
                 # Broadcast test results
                 for result in summary.test_results:
@@ -1091,7 +1206,7 @@ class OrchestrationEngine:
                 correctness_score * config.correctness_weight +
                 speed_score * config.speed_weight +
                 memory_score * config.memory_weight +
-                (sol.tests_passed - sol.tests_total) * config.penalty_wrong_answer
+                (sol.tests_total - sol.tests_passed) * config.penalty_wrong_answer
             )
             
             sol.score = max(0.0, final_score)  # Ensure non-negative
@@ -1136,8 +1251,8 @@ class OrchestrationEngine:
             penalty_wrong_answer=data.get("penalty_wrong_answer", -0.5),
             allow_error_retry=data.get("allow_error_retry", True),
             max_error_retries=data.get("max_error_retries", 2),
-            judge_model=data.get("judge_model", "anthropic/claude-3.5-sonnet"),
-            security_models=data.get("security_models", ["anthropic/claude-3-haiku"])
+            judge_model=data.get("judge_model", DEFAULT_JUDGE_MODEL),
+            security_models=data.get("security_models", ["google/gemini-3-flash-preview"])
         )
     
     async def _update_run_status(
@@ -1147,28 +1262,30 @@ class OrchestrationEngine:
         db_session: Optional[AsyncSession] = None
     ):
         """Update run status in database."""
-        should_close = False
         if db_session is None:
             session_maker = get_session_maker()
-            db_session = session_maker()
-            should_close = True
-        
-        try:
-            await db_session.execute(
-                update(Run)
-                .where(Run.id == run_id)
-                .values(status=status)
-            )
-            await db_session.commit()
-        except Exception as e:
-            logger.error(f"Failed to update run {run_id} status: {e}")
+            async with session_maker() as session:
+                try:
+                    await session.execute(
+                        update(Run)
+                        .where(Run.id == run_id)
+                        .values(status=status)
+                    )
+                    await session.commit()
+                except Exception as e:
+                    logger.error(f"Failed to update run {run_id} status: {e}")
+                    await session.rollback()
+        else:
             try:
+                await db_session.execute(
+                    update(Run)
+                    .where(Run.id == run_id)
+                    .values(status=status)
+                )
+                await db_session.commit()
+            except Exception as e:
+                logger.error(f"Failed to update run {run_id} status: {e}")
                 await db_session.rollback()
-            except Exception as rollback_err:
-                logger.error(f"Failed to rollback: {rollback_err}")
-        finally:
-            if should_close:
-                await db_session.close()
     
     async def _update_round_status(
         self,
@@ -1184,7 +1301,7 @@ class OrchestrationEngine:
         )
         try:
             await db_session.commit()
-        except:
+        except Exception:
             await db_session.rollback()
             raise
     

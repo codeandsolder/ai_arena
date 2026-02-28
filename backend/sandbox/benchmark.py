@@ -39,6 +39,7 @@ class TestCaseResult:
     """Result of running a single test case."""
     __test__ = False
     test_index: int
+    test_name: str
     passed: bool
     actual_output: str
     time_ms: float
@@ -59,6 +60,7 @@ class BenchmarkSummary:
     max_time_ms: float
     max_memory_kb: int
     all_passed: bool
+    score: float = 0.0
     test_results: List[TestCaseResult] = field(default_factory=list)
 
 
@@ -75,7 +77,8 @@ async def benchmark_solution(
     memory_limit_mb: int = 256,
     benchmark_runs: int = 3,
     warmup_runs: int = 1,
-    db_session: Optional[AsyncSession] = None
+    db_session: Optional[AsyncSession] = None,
+    progress_callback: Optional[Any] = None
 ) -> BenchmarkSummary:
     """
     Run benchmark for a solution against all test cases.
@@ -89,6 +92,7 @@ async def benchmark_solution(
         benchmark_runs: Number of benchmark iterations per test
         warmup_runs: Number of warmup iterations (not counted)
         db_session: Database session (if None, a new one will be created)
+        progress_callback: Optional async callback for intermediate results
         
     Returns:
         BenchmarkSummary with aggregated results
@@ -134,16 +138,21 @@ async def benchmark_solution(
                 memory_limit_mb=memory_limit_mb,
                 benchmark_runs=benchmark_runs,
                 warmup_runs=warmup_runs,
-                timeout_seconds=timeout_seconds
+                timeout_seconds=timeout_seconds,
+                test_name=input_file.name
             )
             result.test_index = test_index
             test_results.append(result)
             
+            if progress_callback:
+                await progress_callback(result)
+            
         except Exception as e:
             logger.error(f"Test case {test_index} failed: {e}")
             # Add failed result
-            test_results.append(TestCaseResult(
+            failed_result = TestCaseResult(
                 test_index=test_index,
+                test_name=input_file.name,
                 passed=False,
                 actual_output="",
                 time_ms=0.0,
@@ -151,10 +160,13 @@ async def benchmark_solution(
                 exit_code=-1,
                 error=str(e),
                 verdict="RE"
-            ))
+            )
+            test_results.append(failed_result)
+            if progress_callback:
+                await progress_callback(failed_result)
     
     # Aggregate results
-    summary = _aggregate_results(solution_id, test_results)
+    summary = _aggregate_results(solution_id, test_results, test_cases_dir=test_cases_dir)
     
     # Store results in database
     await _store_results(summary, test_results, db_session)
@@ -223,7 +235,8 @@ async def _run_single_test(
     memory_limit_mb: int,
     benchmark_runs: int,
     warmup_runs: int,
-    timeout_seconds: float
+    timeout_seconds: float,
+    test_name: str
 ) -> TestCaseResult:
     """
     Run a single test case using the test harness.
@@ -272,13 +285,15 @@ async def _run_single_test(
         volumes=volumes,
         mem_limit=f"{memory_limit_mb + 64}m",  # Extra memory for harness overhead
         timeout=int(timeout_seconds),
-        network_disabled=True
+        network_disabled=True,
+        working_dir="/tmp"
     )
     
     if not result.success and not result.stdout:
         # Container failed to run
         return TestCaseResult(
             test_index=0,
+            test_name=test_name,
             passed=False,
             actual_output="",
             time_ms=0.0,
@@ -304,7 +319,8 @@ async def _run_single_test(
         harness_result = json.loads(json_str)
         
         return TestCaseResult(
-            test_index=0,  # Will be set by caller
+            test_index=0,
+            test_name=test_name,  # Will be set by caller
             passed=harness_result.get("passed", False),
             actual_output=harness_result.get("actual_output", ""),
             time_ms=harness_result.get("time_ms", 0.0) or 0.0,
@@ -320,6 +336,7 @@ async def _run_single_test(
         logger.debug(f"Raw output: {result.stdout}")
         return TestCaseResult(
             test_index=0,
+            test_name=test_name,
             passed=False,
             actual_output=result.stdout[:1000],  # Truncate long output
             time_ms=0.0,
@@ -332,6 +349,7 @@ async def _run_single_test(
         logger.error(f"Error processing test result: {e}")
         return TestCaseResult(
             test_index=0,
+            test_name=test_name,
             passed=False,
             actual_output="",
             time_ms=0.0,
@@ -344,7 +362,8 @@ async def _run_single_test(
 
 def _aggregate_results(
     solution_id: int,
-    test_results: List[TestCaseResult]
+    test_results: List[TestCaseResult],
+    test_cases_dir: Optional[str] = None
 ) -> BenchmarkSummary:
     """
     Aggregate results across all test cases.
@@ -352,6 +371,7 @@ def _aggregate_results(
     Args:
         solution_id: Solution ID
         test_results: List of individual test results
+        test_cases_dir: Optional directory to check for task.yaml for subtask scoring
         
     Returns:
         BenchmarkSummary
@@ -359,16 +379,63 @@ def _aggregate_results(
     tests_total = len(test_results)
     tests_passed = sum(1 for r in test_results if r.passed)
     
-    # Calculate timing statistics from passed tests only
-    passed_times = [r.time_ms for r in test_results if r.passed and r.time_ms > 0]
+    # Calculate timing statistics from all tests with timing data
+    timing_data = [r.time_ms for r in test_results if r.time_ms > 0]
     
-    avg_time_ms = sum(passed_times) / len(passed_times) if passed_times else 0.0
-    max_time_ms = max(passed_times) if passed_times else 0.0
+    avg_time_ms = sum(timing_data) / len(timing_data) if timing_data else 0.0
+    max_time_ms = max(timing_data) if timing_data else 0.0
     
     # Get max memory usage
     memory_values = [r.memory_kb for r in test_results if r.memory_kb > 0]
     max_memory_kb = max(memory_values) if memory_values else 0
     
+    score = 0.0
+    
+    # Try to calculate score based on task.yaml subtasks
+    if test_cases_dir:
+        from backend.utils.task_yaml import parse_task_yaml
+        import fnmatch
+        
+        problem_dir = Path(test_cases_dir).parent if Path(test_cases_dir).name == "tests" else Path(test_cases_dir)
+        task_config = parse_task_yaml(problem_dir)
+        
+        if task_config:
+            subtasks = task_config.get_subtasks()
+            if subtasks:
+                for subtask in subtasks:
+                    subtask_score = subtask.get("score", 0.0)
+                    patterns = subtask.get("patterns", [])
+                    
+                    if not patterns:
+                        continue
+                        
+                    # Find which tests belong to this subtask
+                    subtask_tests = []
+                    for pattern_dict in patterns:
+                        inp_pattern = pattern_dict.get("input")
+                        if not inp_pattern:
+                            continue
+                            
+                        for r in test_results:
+                            if fnmatch.fnmatch(r.test_name, inp_pattern):
+                                subtask_tests.append(r)
+                                
+                    # A subtask score is awarded only if all its test cases passed
+                    if subtask_tests and all(t.passed for t in subtask_tests):
+                        score += subtask_score
+            else:
+                # No subtasks defined, proportional scoring
+                if tests_total > 0:
+                    score = (tests_passed / tests_total) * 100.0
+        else:
+            # No task.yaml, proportional scoring
+            if tests_total > 0:
+                score = (tests_passed / tests_total) * 100.0
+    else:
+        # Default proportional scoring
+        if tests_total > 0:
+            score = (tests_passed / tests_total) * 100.0
+            
     return BenchmarkSummary(
         solution_id=solution_id,
         tests_passed=tests_passed,
@@ -377,6 +444,7 @@ def _aggregate_results(
         max_time_ms=max_time_ms,
         max_memory_kb=max_memory_kb,
         all_passed=tests_passed == tests_total,
+        score=score,
         test_results=test_results
     )
 
@@ -398,7 +466,7 @@ async def _store_results(
     
     if db_session is None:
         async with get_db_session() as session:
-            return await store_benchmark_results(summary, test_results, db_session=session)
+            return await _store_results(summary, test_results, db_session=session)
     
     try:
         # Update Solution with aggregate stats
@@ -440,9 +508,157 @@ async def _store_results(
         await db_session.rollback()
         logger.error(f"Failed to store benchmark results: {e}")
         raise
-    finally:
-        if should_close_session and db_session:
-            await db_session.close()
+
+
+async def _run_task_maker(
+    solution_id: int,
+    source_code: str,
+    problem_dir: str,
+    memory_limit_mb: int = 256,
+    db_session: Optional[AsyncSession] = None,
+    progress_callback: Optional[Any] = None
+) -> BenchmarkSummary:
+    """
+    Run evaluation using Task Maker CLI (tmc).
+    
+    Args:
+        solution_id: Solution ID
+        source_code: C++ source code
+        problem_dir: Directory containing task.yaml
+        memory_limit_mb: Memory limit
+        db_session: Optional database session
+        progress_callback: Optional async callback for intermediate results
+        
+    Returns:
+        BenchmarkSummary
+    """
+    logger.info(f"Using Task Maker for solution {solution_id}")
+    container_manager = get_container_manager()
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        source_path = os.path.join(temp_dir, "solution.cpp")
+        with open(source_path, "w") as f:
+            f.write(source_code)
+            
+        # Mount problem_dir to /task and source file to /sandbox/solution.cpp
+        volumes = {
+            os.path.abspath(problem_dir): {"bind": "/task", "mode": "rw"},
+            os.path.abspath(source_path): {"bind": "/sandbox/solution.cpp", "mode": "ro"}
+        }
+        
+        # Execute tmc evaluate
+        # Use working_dir parameter instead of sh -c to change directory
+        command = ["tmc", "evaluate", "--ui", "json", "/sandbox/solution.cpp"]
+        
+        result = await container_manager.execute_command(
+            command=command,
+            volumes=volumes,
+            mem_limit=f"{memory_limit_mb + 256}m",  # Extra memory for tmc/compilation
+            timeout=300,
+            network_disabled=True,
+            working_dir="/task"
+        )
+        
+        if not result.success and not result.stdout:
+             raise BenchmarkError(f"Task Maker execution failed: {result.error or 'Unknown error'}")
+
+        # Parse tmc output (multiple JSON objects)
+        test_results: List[TestCaseResult] = []
+        final_summary = None
+        
+        # tmc --ui json outputs multiple JSON objects separated by newlines
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+                
+            try:
+                msg = json.loads(line)
+                
+                # Check for individual test results
+                if "IOITestcaseScore" in msg:
+                    data = msg["IOITestcaseScore"]
+                    # Map to TestCaseResult
+                    # The test name might be something like 'test01'
+                    test_name = data.get("test_name", f"test_{len(test_results)+1}")
+                    passed = data.get("score", 0.0) > 0.0 or data.get("verdict") == "Correct"
+                    
+                    verdict_map = {
+                        "Correct": "AC",
+                        "WrongAnswer": "WA",
+                        "TimeLimit": "TLE",
+                        "MemoryLimit": "MLE",
+                        "RuntimeError": "RE",
+                        "Score": "SC"
+                    }
+                    raw_verdict = data.get("verdict", "RE")
+                    verdict = verdict_map.get(raw_verdict, "RE")
+                    
+                    tc_result = TestCaseResult(
+                        test_index=len(test_results) + 1,
+                        test_name=test_name,
+                        passed=passed,
+                        actual_output="",
+                        # tmc usually gives time in seconds for 'time' or 'cpu_time'
+                        time_ms=(data.get("time") or data.get("cpu_time") or 0.0) * 1000.0,
+                        memory_kb=data.get("memory", 0) // 1024, # B to KB
+                        exit_code=0 if passed else -1,
+                        error="",
+                        verdict=verdict
+                    )
+                    test_results.append(tc_result)
+                    
+                    if progress_callback:
+                        await progress_callback(tc_result)
+                    
+                # Check for evaluation summary
+                elif "IOIEvaluation" in msg:
+                    final_summary = msg["IOIEvaluation"]
+                    
+            except json.JSONDecodeError:
+                continue
+        
+        if not test_results:
+             # Check if there was a compilation error in stdout/stderr
+             if "Compilation error" in result.stdout or "Compilation error" in result.stderr:
+                 raise BenchmarkError(f"Compilation failed under Task Maker:\n{result.stdout}\n{result.stderr}")
+             raise BenchmarkError(f"Task Maker produced no test results. Output: {result.stdout[:500]}")
+
+        # Aggregate summary
+        tests_total = len(test_results)
+        tests_passed = sum(1 for r in test_results if r.passed)
+        
+        passed_times = [r.time_ms for r in test_results if r.passed and r.time_ms > 0]
+        avg_time_ms = sum(passed_times) / len(passed_times) if passed_times else 0.0
+        max_time_ms = max(passed_times) if passed_times else 0.0
+        
+        memory_values = [r.memory_kb for r in test_results if r.memory_kb > 0]
+        max_memory_kb = max(memory_values) if memory_values else 0
+        
+        # Get score from final_summary if available
+        score = 0.0
+        if final_summary:
+            score = final_summary.get("score", 0.0)
+        else:
+            # Fallback proportional scoring
+            score = (tests_passed / tests_total * 100.0) if tests_total > 0 else 0.0
+
+        summary = BenchmarkSummary(
+            solution_id=solution_id,
+            tests_passed=tests_passed,
+            tests_total=tests_total,
+            avg_time_ms=avg_time_ms,
+            max_time_ms=max_time_ms,
+            max_memory_kb=max_memory_kb,
+            all_passed=tests_passed == tests_total,
+            score=score,
+            test_results=test_results
+        )
+        
+        # Store results in database
+        await _store_results(summary, test_results, db_session)
+        
+        return summary
 
 
 async def compile_and_benchmark(
@@ -456,7 +672,10 @@ async def compile_and_benchmark(
     memory_limit_mb: int = 256,
     benchmark_runs: int = 3,
     warmup_runs: int = 1,
-    db_session: Optional[AsyncSession] = None
+    db_session: Optional[AsyncSession] = None,
+    additional_files: Optional[Dict[str, str]] = None,
+    problem_dir: Optional[str] = None,
+    progress_callback: Optional[Any] = None
 ) -> Tuple[bool, str, Optional[BenchmarkSummary]]:
     """
     Compile a solution and run benchmarks if compilation succeeds.
@@ -475,10 +694,33 @@ async def compile_and_benchmark(
         benchmark_runs: Number of benchmark runs
         warmup_runs: Number of warmup runs
         db_session: Optional database session
+        additional_files: Optional dictionary of {filename: content} to include in compilation
+        problem_dir: Optional problem directory containing task.yaml
+        progress_callback: Optional async callback for intermediate results
         
     Returns:
         Tuple of (success, message, benchmark_summary or None)
     """
+    # 1. Check if we should use Task Maker (tmc)
+    if problem_dir and os.path.exists(os.path.join(problem_dir, "task.yaml")):
+        try:
+            summary = await _run_task_maker(
+                solution_id=solution_id,
+                source_code=source_code,
+                problem_dir=problem_dir,
+                memory_limit_mb=memory_limit_mb,
+                db_session=db_session,
+                progress_callback=progress_callback
+            )
+            return True, "Task Maker evaluation successful", summary
+        except Exception as e:
+            logger.warning(f"Task Maker evaluation failed, falling back: {e}")
+            # If Task Maker fails, we continue with custom behavior
+            # BUT if it was a compilation error from Task Maker, we might want to return that
+            if isinstance(e, BenchmarkError) and "Compilation failed" in str(e):
+                await _update_solution_compile_status(solution_id, False, str(e), db_session)
+                return False, str(e), None
+
     container_manager = get_container_manager()
     
     # Create temporary directory for compilation
@@ -489,6 +731,13 @@ async def compile_and_benchmark(
         # Write source code
         with open(source_path, "w") as f:
             f.write(source_code)
+        
+        # Write additional files
+        if additional_files:
+            for filename, content in additional_files.items():
+                file_path = os.path.join(temp_dir, filename)
+                with open(file_path, "w") as f:
+                    f.write(content)
         
         # Compile
         from backend.sandbox.compiler import validate_compiler, validate_flags, perform_safety_check
@@ -506,18 +755,26 @@ async def compile_and_benchmark(
             return False, error_msg, None
         
         # Build compilation command
-        cmd_parts = [validated_compiler, "/workspace/solution.cpp", "-o", "/workspace/solution"]
+        # Include all .cpp files in the sandbox directory
+        cpp_files = ["/sandbox/solution.cpp"]
+        if additional_files:
+            for filename in additional_files:
+                if filename.endswith(".cpp"):
+                    cpp_files.append(f"/sandbox/{filename}")
+        
+        cmd_parts = [validated_compiler] + cpp_files + ["-o", "/sandbox/solution"]
         cmd_parts.extend(validated_flags)
         
         logger.info(f"Compiling solution {solution_id} with command: {' '.join(cmd_parts)}")
         
         # Run compilation in container
         # Execute directly instead of via sh -c to prevent shell injection
+        # Use /sandbox to avoid conflict with default tmpfs at /workspace
         compile_result = await container_manager.execute_command(
             command=cmd_parts,
             volumes={
-                source_path: {"bind": "/workspace/solution.cpp", "mode": "ro"},
-                temp_dir: {"bind": "/workspace", "mode": "rw"}
+                source_path: {"bind": "/sandbox/solution.cpp", "mode": "ro"},
+                temp_dir: {"bind": "/sandbox", "mode": "rw"}
             },
             mem_limit="512m",
             timeout=60,
@@ -546,7 +803,8 @@ async def compile_and_benchmark(
                 memory_limit_mb=memory_limit_mb,
                 benchmark_runs=benchmark_runs,
                 warmup_runs=warmup_runs,
-                db_session=db_session
+                db_session=db_session,
+                progress_callback=progress_callback
             )
             
             return True, "Compilation and benchmarking successful", summary
@@ -572,11 +830,9 @@ async def _update_solution_compile_status(
         compile_log: Compilation output
         db_session: Optional database session
     """
-    should_close_session = False
-    
     if db_session is None:
-        async with get_db_session() as session:
-            return await update_solution_status(solution_id, success, compile_log, db_session=session)
+        logger.debug("Skipping solution status update (no db_session provided)")
+        return
     
     try:
         from sqlalchemy import update
@@ -595,6 +851,3 @@ async def _update_solution_compile_status(
     except Exception as e:
         await db_session.rollback()
         logger.error(f"Failed to update solution status: {e}")
-    finally:
-        if should_close_session and db_session:
-            await db_session.close()

@@ -25,6 +25,7 @@ from backend.api import (
     rounds_router,
     runs_router,
     solutions_router,
+    verify_example_router,
     websocket_router,
 )
 from backend.config import ensure_directories
@@ -33,8 +34,17 @@ from backend.database.session import close_engine, AsyncSessionLocal
 from backend.services.problem_ingestion import IOIIngestor
 
 
+# Global state for backend status
+startup_status = {
+    "status": "starting",
+    "message": "Initializing...",
+    "ready": False
+}
+
+
 async def ingest_default_problems():
     """Background task to ingest default problems on startup."""
+    startup_status["message"] = "Parsing problems..."
     logger.info("Starting background ingestion of default problems...")
     repo_url = "https://github.com/austrian-olympiad-informatics/ioi-tasks"
     
@@ -43,8 +53,15 @@ async def ingest_default_problems():
             async with IOIIngestor(session) as ingestor:
                 await ingestor.ingest_repository(repo_url)
         logger.info("Background ingestion completed successfully.")
+        startup_status["status"] = "ready"
+        startup_status["message"] = "Ready"
+        startup_status["ready"] = True
     except Exception as e:
         logger.error(f"Background ingestion failed: {e}")
+        startup_status["status"] = "error"
+        startup_status["message"] = f"Ingestion failed: {e}"
+        # We might still want to set ready=True if the API is otherwise functional
+        startup_status["ready"] = True
 
 
 def check_docker_image() -> bool:
@@ -149,6 +166,7 @@ app.include_router(runs_router, prefix="/api/v1")
 app.include_router(rounds_router, prefix="/api/v1")
 app.include_router(solutions_router, prefix="/api/v1")
 app.include_router(api_calls_router, prefix="/api/v1")
+app.include_router(verify_example_router, prefix="/api/v1")
 app.include_router(websocket_router, prefix="/api/v1")
 
 
@@ -176,6 +194,17 @@ async def root():
     }
 
 
+@app.get("/api/v1/status", tags=["status"])
+async def status_check():
+    """
+    Detailed status check endpoint for startup tasks.
+    
+    Returns:
+        Current status of the backend, including startup progress.
+    """
+    return startup_status
+
+
 @app.get("/health", tags=["health"])
 async def health_check():
     """
@@ -186,7 +215,8 @@ async def health_check():
     """
     return {
         "status": "healthy",
-        "service": "ai-optimization-arena-api"
+        "service": "ai-optimization-arena-api",
+        "ready": startup_status["ready"]
     }
 
 

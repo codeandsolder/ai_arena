@@ -14,7 +14,7 @@ import tempfile
 import os
 import subprocess
 from pathlib import Path
-from typing import List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +196,8 @@ async def compile_solution(
     flags: List[str],
     output_path: str,
     timeout: int = 60,
-    skip_safety_check: bool = False
+    skip_safety_check: bool = False,
+    additional_files: Optional[Dict[str, str]] = None
 ) -> Tuple[bool, str, str, Optional[str]]:
     """
     Compile a C++ solution with security checks.
@@ -208,6 +209,7 @@ async def compile_solution(
         output_path: Path where the compiled binary should be written
         timeout: Compilation timeout in seconds (default: 60)
         skip_safety_check: If True, skip the static safety check (e.g., if AI analysis already done)
+        additional_files: Optional dictionary of {filename: content} to include in compilation
         
     Returns:
         Tuple of (success, stdout, stderr, output_binary_path or None)
@@ -244,8 +246,25 @@ async def compile_solution(
             logger.error(f"Failed to write source file: {e}")
             return False, "", f"Failed to write source file: {e}", None
         
+        # Write additional files
+        if additional_files:
+            for filename, content in additional_files.items():
+                file_path = Path(temp_dir) / filename
+                try:
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                except Exception as e:
+                    logger.error(f"Failed to write additional file {filename}: {e}")
+                    return False, "", f"Failed to write additional file {filename}: {e}", None
+
         # Build compilation command
         # Use wsl x86_64-w64-mingw32-g++ on Windows for local testing
+        cpp_files = [str(source_path)]
+        if additional_files:
+            for filename in additional_files:
+                if filename.endswith(".cpp"):
+                    cpp_files.append(str(Path(temp_dir) / filename))
+
         if os.name == 'nt':
             # Convert Windows path to WSL path
             # e.g., C:\Users\Jan\... -> /mnt/c/Users/Jan/...
@@ -267,19 +286,19 @@ async def compile_solution(
                         return f"/mnt/{drive.lower()}{rest}"
                     return path
 
-            wsl_source_path = to_wsl_path(str(source_path))
+            wsl_cpp_files = [to_wsl_path(f) for f in cpp_files]
             wsl_output_path = to_wsl_path(safe_output_path)
 
             cmd = [
                 "wsl",
                 "g++",
-                wsl_source_path,
+            ] + wsl_cpp_files + [
                 "-o", wsl_output_path,
             ] + validated_flags
         else:
             cmd = [
                 validated_compiler,
-                str(source_path),
+            ] + cpp_files + [
                 "-o", safe_output_path,
             ] + validated_flags
         
@@ -385,21 +404,22 @@ async def compile_in_container(
         source_path = f.name
     
     try:
-        output_binary = "/workspace/solution"
+        output_binary = "/sandbox/solution"
         
         # Build compilation command
-        cmd_parts = [validated_compiler, "/workspace/solution.cpp", "-o", output_binary]
+        cmd_parts = [validated_compiler, "/sandbox/solution.cpp", "-o", output_binary]
         cmd_parts.extend(validated_flags)
         
         logger.info(f"Compiling in container with command: {' '.join(cmd_parts)}")
         
         # Run compilation in container
         # Execute directly instead of via sh -c to prevent shell injection
+        # Use /sandbox to avoid conflict with default tmpfs at /workspace
         success, stdout, stderr = await container_runner(
             cmd_parts,
             timeout=timeout,
             volumes={
-                source_path: {"bind": "/workspace/solution.cpp", "mode": "ro"}
+                source_path: {"bind": "/sandbox/solution.cpp", "mode": "ro"}
             }
         )
         

@@ -18,7 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend import config
 from backend.database.models import Problem
-from backend.database.session import get_db
+from backend.database.session import AsyncSessionLocal, get_db
+from backend.orchestrator.model_client import ModelClient
 
 router = APIRouter(prefix="/problems", tags=["problems"])
 
@@ -26,6 +27,13 @@ router = APIRouter(prefix="/problems", tags=["problems"])
 # =============================================================================
 # Pydantic Schemas
 # =============================================================================
+
+
+class ProblemMetadataParseRequest(BaseModel):
+    """Schema for triggering metadata parsing."""
+    model: str = Field(..., description="LLM model to use for parsing")
+    prompt: str = Field(..., description="Prompt to use for parsing")
+    fallback_model: Optional[str] = Field(None, description="Model to use if no editorial is found")
 
 
 class ProblemImportRequest(BaseModel):
@@ -88,6 +96,8 @@ class ProblemResponse(ProblemBase):
     last_synced_at: Optional[datetime] = None
     tests_downloaded: bool = False
     created_at: datetime
+    short_description: Optional[str] = None
+    tags: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -244,6 +254,32 @@ async def create_problem(problem_data: ProblemCreate, db: AsyncSession = Depends
     problem_dir.mkdir(parents=True, exist_ok=True)
 
     return problem
+
+
+@router.post("/parse-metadata")
+async def parse_metadata(
+    request: ProblemMetadataParseRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Trigger a background job to parse metadata for all available problems.
+    """
+    from backend.services.metadata_extraction import parse_all_problems_metadata
+    
+    model_client = ModelClient()
+    
+    # Pass the session maker instead of the request-scoped db session
+    # to avoid issues where the session is closed before the background task runs
+    background_tasks.add_task(
+        parse_all_problems_metadata,
+        session_factory=AsyncSessionLocal,
+        model_client=model_client,
+        model=request.model,
+        prompt=request.prompt,
+        fallback_model=request.fallback_model
+    )
+    
+    return {"message": "Metadata parsing started in background"}
 
 
 @router.put("/{problem_id}", response_model=ProblemResponse)
@@ -404,6 +440,9 @@ async def upload_test_cases(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid ZIP file format"
         )
+    except HTTPException:
+        # Re-raise FastAPIs HTTPExceptions as is
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
