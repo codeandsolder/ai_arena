@@ -1,357 +1,536 @@
+"""
+AI Optimization Arena – Launcher
+"""
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, ttk
+from tkinter import messagebox, ttk
 import subprocess
 import threading
+import queue
 import os
 import sys
 import time
+import re
+import json
 import urllib.request
 import signal
+import shutil
+import argparse
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import webbrowser
 
-# Constants
-BACKEND_PORT = 8000
-FRONTEND_PORT = 5173
+# ── Constants ──────────────────────────────────────────────────────────────────
+BACKEND_PORT           = 8000
+FRONTEND_PORT          = 5173
 NETWORK_INTERFACE_PORT = 8001
-BASE_DIR = Path(__file__).parent.resolve()
-BACKEND_DIR = BASE_DIR
-FRONTEND_DIR = BASE_DIR / "frontend"
-DATA_DIR = BASE_DIR / "backend" / "data"
-DATABASE_PATH = DATA_DIR / "arena.db"
-PROBLEMS_REPO_DIR = DATA_DIR / "problems_repo"
+BASE_DIR         = Path(__file__).parent.resolve()
+BACKEND_DIR      = BASE_DIR
+FRONTEND_DIR     = BASE_DIR / "frontend"
+DATA_DIR         = BASE_DIR / "backend" / "data"
+DATABASE_PATH    = DATA_DIR / "arena.db"
+PROBLEMS_DIR     = DATA_DIR / "problems"
 
+# ── Tailwind Dark Theme ────────────────────────────────────────────────────────
+BG_900       = "#111827"
+BG_800       = "#1F2937"
+BG_700       = "#374151"
+TEXT_PRIMARY = "#F3F4F6"
+TEXT_MUTED   = "#9CA3AF"
+BLUE_600     = "#2563EB"
+BLUE_500     = "#3B82F6"
+RED_600      = "#DC2626"
+GREEN_600    = "#16A34A"
+ORANGE_500   = "#F97316"
+FONT_MONO    = ("Consolas", 9)
+FONT_UI      = ("Segoe UI", 9)
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+_ANSI = re.compile(
+    r'\x1b\[[0-9;:<=>?]*[ -/]*[@-~]'
+    r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)'
+    r'|\x1b[@-_]'
+    r'|\x1b[0-9]'
+)
+
+# Regex to detect standard HTTP logs (e.g. "GET /api/v1/status HTTP/1.1" 200 OK)
+_HTTP_LOG_RE = re.compile(r'"(?:GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\s+.*?\s+HTTP/[0-9.]+"\s+\d{3}')
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI.sub('', s)
+
+def _clean_env() -> dict:
+    env = os.environ.copy()
+    env["NO_COLOR"]         = "1"
+    env["FORCE_COLOR"]      = "0"
+    env["TERM"]             = "dumb"
+    env["VITE_CLI_COLOR"]   = "false"
+    # CRITICAL: Forces Python to flush stdout instantly rather than block-buffering
+    env["PYTHONUNBUFFERED"] = "1" 
+    return env
+
+
+# ── Process & Log Interfaces ───────────────────────────────────────────────────
 class ProcessManager:
-    def __init__(self, log_widget, name):
-        self.log_widget = log_widget
-        self.name = name
-        self.process = None
-        self.stop_event = threading.Event()
+    def __init__(self, log_target, name: str, push_callback):
+        self._log  = log_target
+        self.name  = name
+        self._push_cb = push_callback
+        self.proc  = None
+        self._stop = threading.Event()
 
-    def log(self, message):
-        self.log_widget.configure(state='normal')
-        self.log_widget.insert(tk.END, message + "\n")
-        self.log_widget.see(tk.END)
-        self.log_widget.configure(state='disabled')
+    def _push(self, line: str):
+        self._push_cb(self._log, line)
 
     def start(self, cmd, cwd=None):
-        if self.process:
-            self.stop()
-
-        self.stop_event.clear()
-        self.log(f"--- Starting {self.name} ---")
-        
-        # Use shell=True for Windows to correctly handle command strings
-        self.process = subprocess.Popen(
+        if self.proc:
+            self._kill()
+        self._stop.clear()
+        self._push(f"▶  Starting {self.name}…")
+        self.proc = subprocess.Popen(
             cmd,
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             shell=True,
             bufsize=1,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+            env=_clean_env(),
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
         )
+        threading.Thread(target=self._reader, daemon=True).start()
 
-        threading.Thread(target=self._read_output, daemon=True).start()
-
-    def _read_output(self):
-        for line in iter(self.process.stdout.readline, ''):
-            if self.stop_event.is_set():
+    def _reader(self):
+        for line in iter(self.proc.stdout.readline, ""):
+            if self._stop.is_set():
                 break
-            self.log(line.strip())
-        if self.process:
-            self.process.stdout.close()
+            cleaned = _strip_ansi(line.rstrip())
+            if cleaned:
+                self._push(cleaned)
+        if self.proc:
+            self.proc.stdout.close()
+
+    def _kill(self):
+        if not self.proc:
+            return
+        self._stop.set()
+        self._push(f"■  Stopping {self.name}…")
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                           capture_output=True)
+        else:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        self.proc = None
 
     def stop(self):
-        if self.process:
-            self.stop_event.set()
-            self.log(f"--- Stopping {self.name} ---")
-            if os.name == 'nt':
-                # Kill the process group on Windows
-                subprocess.run(['taskkill', '/F', '/T', '/PID', str(self.process.pid)], capture_output=True)
-            else:
-                try:
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            self.process = None
+        self._kill()
 
+    def wait_port_free(self, port: int, timeout: int = 10):
+        self._push(f"⏳  Waiting for port {port} to be free…")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=0.5):
+                    pass
+                time.sleep(0.3)
+            except Exception:
+                self._push(f"✔  Port {port} is free")
+                return
+        self._push(f"⚠  Port {port} still busy after {timeout} s, continuing anyway")
+
+
+# ── Network Server ─────────────────────────────────────────────────────────────
 class NetworkHandler(BaseHTTPRequestHandler):
+    _app = None
+
+    def log_message(self, fmt, *args):
+        if self._app:
+            self._app.log_webserver(f"{self.address_string()} – {fmt % args}")
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"status": "ok", "service": "ArenaLauncher"}')
+
     def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length).decode('utf-8')
-        
-        if self.path == '/restart':
-            launcher.restart_all()
+        if not self._app:
+            self.send_response(503)
+            self.end_headers()
+            return
+        routes = {
+            "/restart":      self._app._async_restart,
+            "/delete-db":    self._app._async_delete_db,
+            "/delete-cache": self._app._async_delete_cache,
+        }
+        fn = routes.get(self.path)
+        if fn:
+            threading.Thread(target=fn, daemon=True).start()
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"Restarting all processes...")
-        elif self.path == '/delete-db':
-            launcher.delete_db()
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Database deleted.")
-        elif self.path == '/delete-cache':
-            launcher.delete_cache()
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Cache deleted.")
         else:
             self.send_response(404)
             self.end_headers()
 
-class ArenaLauncher:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("AI Optimization Arena Launcher")
-        self.root.geometry("1000x700")
 
-        self.setup_ui()
+# ── Core Controller (Shared GUI/Headless Logic) ────────────────────────────────
+class AppCore:
+    def __init__(self, backend_log, frontend_log, set_status_cb):
+        self.backend_log = backend_log
+        self.frontend_log = frontend_log
+        self.set_status = set_status_cb
         
-        self.backend_manager = ProcessManager(self.backend_log, "Backend")
-        self.frontend_manager = ProcessManager(self.frontend_log, "Frontend")
-
-        # Start network interface
-        threading.Thread(target=self.start_network_interface, daemon=True).start()
-
-        # Initial cleanup and startup
-        self.root.after(100, self.initial_startup)
-
-    def setup_ui(self):
-        # Control Panel
-        control_frame = tk.Frame(self.root)
-        control_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
-
-        tk.Button(control_frame, text="Restart All", command=self.restart_all, bg="orange").pack(side=tk.LEFT, padx=5)
-        tk.Button(control_frame, text="Delete DB", command=self.delete_db, bg="red", fg="white").pack(side=tk.LEFT, padx=5)
-        tk.Button(control_frame, text="Delete Cache", command=self.delete_cache, bg="red", fg="white").pack(side=tk.LEFT, padx=5)
+        self.backend_mgr  = ProcessManager(self.backend_log, "Backend", self.push_log)
+        self.frontend_mgr = ProcessManager(self.frontend_log, "Frontend", self.push_log)
         
-        self.status_label = tk.Label(control_frame, text="Status: Ready", font=("Arial", 10, "bold"))
-        self.status_label.pack(side=tk.RIGHT, padx=10)
+        NetworkHandler._app = self
+        threading.Thread(target=self._serve_network, daemon=True).start()
 
-        # Logs Notebook
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(expand=True, fill=tk.BOTH, padx=5, pady=5)
+    def push_log(self, target, line):
+        pass
 
-        self.backend_log = scrolledtext.ScrolledText(self.notebook, state='disabled', wrap=tk.WORD, font=("Consolas", 9))
-        self.notebook.add(self.backend_log, text="Backend Logs")
+    def log_webserver(self, msg):
+        pass
 
-        self.frontend_log = scrolledtext.ScrolledText(self.notebook, state='disabled', wrap=tk.WORD, font=("Consolas", 9))
-        self.notebook.add(self.frontend_log, text="Frontend Logs")
+    def startup(self):
+        self._kill_ports()
+        self._do_start_backend()
 
-        # Settings Tab
-        self.settings_frame = tk.Frame(self.notebook)
-        self.notebook.add(self.settings_frame, text="Settings")
-        self.setup_settings_ui()
+    def shutdown(self):
+        self.backend_mgr.stop()
+        self.frontend_mgr.stop()
+        self._kill_ports()
 
-    def setup_settings_ui(self):
-        # Metadata Parsing Settings
-        meta_frame = tk.LabelFrame(self.settings_frame, text="Metadata Parsing", padx=10, pady=10)
-        meta_frame.pack(fill=tk.X, padx=10, pady=10)
+    def _async_restart(self):
+        self.backend_mgr.stop()
+        self.frontend_mgr.stop()
+        self._kill_ports() # Aggressively clean up ports
+        self.backend_mgr.wait_port_free(BACKEND_PORT)
+        self._do_start_backend()
 
-        # Model
-        tk.Label(meta_frame, text="Parsing Model:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.meta_model = tk.Entry(meta_frame, width=50)
-        self.meta_model.insert(0, "google/gemini-2.0-flash-001")
-        self.meta_model.grid(row=0, column=1, sticky=tk.W, pady=2)
-
-        # Fallback Model
-        tk.Label(meta_frame, text="Fallback Model (no editorial):").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self.meta_fallback_model = tk.Entry(meta_frame, width=50)
-        self.meta_fallback_model.insert(0, "google/gemini-2.0-pro-exp-02-05")
-        self.meta_fallback_model.grid(row=1, column=1, sticky=tk.W, pady=2)
-
-        # Prompt
-        tk.Label(meta_frame, text="Parsing Prompt:").grid(row=2, column=0, sticky=tk.NW, pady=2)
-        self.meta_prompt = scrolledtext.ScrolledText(meta_frame, width=60, height=10, font=("Arial", 9))
-        default_prompt = (
-            "Extract a short 2-sentence description and a list of algorithmic tags "
-            "from this competitive programming problem statement and editorial.\n\n"
-            "Respond ONLY with a JSON object:\n"
-            "{\n"
-            "  \"short_description\": \"...\",\n"
-            "  \"tags\": [\"tag1\", \"tag2\", ...]\n"
-            "}"
-        )
-        self.meta_prompt.insert(tk.END, default_prompt)
-        self.meta_prompt.grid(row=2, column=1, sticky=tk.W, pady=2)
-
-        # Action Button
-        tk.Button(meta_frame, text="Start Parsing Metadata", command=self.trigger_metadata_parsing, bg="lightblue").grid(row=3, column=1, sticky=tk.E, pady=10)
-
-    def trigger_metadata_parsing(self):
-        model = self.meta_model.get()
-        fallback = self.meta_fallback_model.get()
-        prompt = self.meta_prompt.get("1.0", tk.END).strip()
-
-        if not model or not prompt:
-            messagebox.showerror("Error", "Model and Prompt are required")
-            return
-
-        def run_request():
-            import json
-            import urllib.request
-            url = f"http://127.0.0.1:{BACKEND_PORT}/api/v1/problems/parse-metadata"
-            data = json.dumps({
-                "model": model,
-                "prompt": prompt,
-                "fallback_model": fallback if fallback else None
-            }).encode('utf-8')
-
+    def _kill_port_force(self, port):
+        """Actively hunts down the PID bound to a port and snipes it."""
+        if os.name == "nt":
             try:
-                req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-                with urllib.request.urlopen(req) as response:
-                    if response.status == 200:
-                        self.root.after(0, lambda: messagebox.showinfo("Success", "Metadata parsing started in background"))
-                    else:
-                        self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to start parsing: {response.status}"))
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Connection error: {e}"))
+                out = subprocess.check_output(
+                    f"netstat -aon | findstr :{port} | findstr LISTENING",
+                    shell=True).decode()
+                for line in out.strip().splitlines():
+                    parts = line.split()
+                    if parts and parts[-1].isdigit():
+                        pid = parts[-1]
+                        self.backend_mgr._push(f"✂  Sniping orphan PID {pid} on port {port}…")
+                        subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
+            except subprocess.CalledProcessError:
+                pass
+        else:
+            subprocess.run(f"fuser -k {port}/tcp", shell=True, capture_output=True)
 
-        threading.Thread(target=run_request, daemon=True).start()
+    def _kill_ports(self):
+        self.set_status("Cleaning up ports…", TEXT_MUTED)
+        self._kill_port_force(BACKEND_PORT)
+        self._kill_port_force(FRONTEND_PORT)
 
-    def start_network_interface(self):
-        try:
-            server = HTTPServer(('localhost', NETWORK_INTERFACE_PORT), NetworkHandler)
-            server.serve_forever()
-        except Exception as e:
-            print(f"Network interface failed: {e}")
+    def _async_delete_db(self):
+        self.set_status("Stopping backend…", ORANGE_500)
+        self.backend_mgr.stop()
+        
+        # Kill the port explicitly since Windows process trees can orphan the python driver
+        self._kill_port_force(BACKEND_PORT)
+        self.backend_mgr.wait_port_free(BACKEND_PORT)
 
-    def kill_ports(self):
-        self.status_label.config(text="Status: Cleaning up ports...")
-        for port in [BACKEND_PORT, FRONTEND_PORT]:
-            if os.name == 'nt':
-                # Windows command to find PID on port and kill it
-                try:
-                    output = subprocess.check_output(f'netstat -aon | findstr :{port} | findstr LISTENING', shell=True).decode()
-                    for line in output.strip().split('\n'):
-                        parts = line.split()
-                        if parts:
-                            pid = parts[-1]
-                            subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True)
-                except subprocess.CalledProcessError:
-                    pass # Port not in use
-            else:
-                subprocess.run(f"fuser -k {port}/tcp", shell=True, capture_output=True)
-
-    def delete_db(self):
-        if messagebox.askyesno("Confirm", "Delete database (arena.db)?"):
-            self.backend_manager.stop()
-            time.sleep(1) # Wait for file handles to release
-            if DATABASE_PATH.exists():
+        if DATABASE_PATH.exists():
+            for attempt in range(10):
                 try:
                     DATABASE_PATH.unlink()
-                    self.backend_manager.log("--- Database deleted ---")
-                except Exception as e:
-                    self.backend_manager.log(f"--- Error deleting DB: {e} ---")
-            else:
-                self.backend_manager.log("--- Database file not found ---")
+                    self.backend_mgr._push("■  Database deleted successfully")
+                    break
+                except PermissionError as e:
+                    if attempt == 9:
+                        self.backend_mgr._push(f"✖  Failed to delete DB (Lock persisted): {e}")
+                        return
+                    time.sleep(0.5)
+        else:
+            self.backend_mgr._push("■  Database file not found")
 
-    def delete_cache(self):
-        if messagebox.askyesno("Confirm", "Delete problems cache?"):
-            if PROBLEMS_REPO_DIR.exists():
-                try:
-                    import shutil
-                    shutil.rmtree(PROBLEMS_REPO_DIR)
-                    self.backend_manager.log("--- Cache deleted ---")
-                except Exception as e:
-                    self.backend_manager.log(f"--- Error deleting cache: {e} ---")
-            else:
-                self.backend_manager.log("--- Cache directory not found ---")
+        self._do_start_backend()
 
-    def start_backend(self):
-        self.status_label.config(text="Status: Starting Backend...")
-        self.backend_manager.start("uv run python -m backend.main", cwd=str(BACKEND_DIR))
-        threading.Thread(target=self.wait_for_backend, daemon=True).start()
-
-    def wait_for_backend(self):
-        import json
-        url = f"http://127.0.0.1:{BACKEND_PORT}/api/v1/status"
-        health_url = f"http://127.0.0.1:{BACKEND_PORT}/"
-        
-        # Phase 1: Wait for any response from backend (server started)
-        retries = 30
-        connected = False
-        while retries > 0:
+    def _async_delete_cache(self):
+        if PROBLEMS_DIR.exists():
             try:
-                with urllib.request.urlopen(health_url, timeout=1) as response:
-                    if response.status == 200:
-                        connected = True
+                shutil.rmtree(PROBLEMS_DIR)
+                self.backend_mgr._push("■  Problems cache deleted")
+            except Exception as e:
+                self.backend_mgr._push(f"✖  Error deleting cache: {e}")
+        else:
+            self.backend_mgr._push("■  Problems directory not found")
+
+    def _do_start_backend(self):
+        self.set_status("Starting backend…", ORANGE_500)
+        self.backend_mgr.start("uv run python -m backend.main", cwd=str(BACKEND_DIR))
+        self._wait_for_backend()
+
+    def _wait_for_backend(self):
+        status_url = f"http://127.0.0.1:{BACKEND_PORT}/api/v1/status"
+        health_url = f"http://127.0.0.1:{BACKEND_PORT}/"
+
+        for _ in range(30):
+            try:
+                with urllib.request.urlopen(health_url, timeout=1) as r:
+                    if r.status == 200:
                         break
-            except:
+            except Exception:
                 pass
             time.sleep(1)
-            retries -= 1
-        
-        if not connected:
-            self.backend_manager.log("--- Backend server failed to start within 30s ---")
-            self.root.after(0, self.start_frontend)
+        else:
+            self.backend_mgr._push("✖  Backend failed to start within 30 s")
+            self._do_start_frontend()
             return
 
-        # Phase 2: Wait for backend to be "ready"
-        self.backend_manager.log("--- Backend connected, waiting for initialization... ---")
-        retries = 300 # 5 minutes
-        while retries > 0:
+        self.backend_mgr._push("✔  Backend connected, waiting for initialisation…")
+        for _ in range(300):
             try:
-                with urllib.request.urlopen(url, timeout=1) as response:
-                    if response.status == 200:
-                        data = json.loads(response.read().decode())
+                with urllib.request.urlopen(status_url, timeout=1) as r:
+                    if r.status == 200:
+                        data = json.loads(r.read().decode())
                         if data.get("ready"):
-                            self.backend_manager.log("--- Backend is ready ---")
-                            self.root.after(0, self.start_frontend)
+                            self.backend_mgr._push("✔  Backend is ready")
+                            self._do_start_frontend()
                             return
-                        else:
-                            msg = data.get("message", "Initializing...")
-                            self.status_label.config(text=f"Status: {msg}")
+                        self.set_status(data.get("message", "Initializing…"), ORANGE_500)
             except Exception as e:
-                self.backend_manager.log(f"--- Connection lost while waiting for ready: {e} ---")
+                self.backend_mgr._push(f"✖  Connection lost: {e}")
                 break
             time.sleep(1)
-            retries -= 1
-        
-        self.backend_manager.log("--- Backend initialization timed out, starting frontend anyway ---")
-        self.root.after(0, self.start_frontend)
 
-    def start_frontend(self):
-        self.status_label.config(text="Status: Starting Frontend...")
-        self.frontend_manager.start("npm run dev", cwd=str(FRONTEND_DIR))
-        threading.Thread(target=self.wait_for_frontend, daemon=True).start()
+        self.backend_mgr._push("⚠  Backend init timed out – starting frontend anyway")
+        self._do_start_frontend()
 
-    def wait_for_frontend(self):
+    def _do_start_frontend(self):
+        self.set_status("Starting frontend…", ORANGE_500)
+        self.frontend_mgr.start("npm run dev", cwd=str(FRONTEND_DIR))
+        self._wait_for_frontend()
+
+    def _wait_for_frontend(self):
         url = f"http://localhost:{FRONTEND_PORT}"
-        retries = 30
-        while retries > 0:
+        for _ in range(30):
             try:
-                with urllib.request.urlopen(url, timeout=1) as response:
-                    if response.status == 200:
-                        self.status_label.config(text="Status: Running")
-                        webbrowser.open(url)
+                with urllib.request.urlopen(url, timeout=1) as r:
+                    if r.status == 200:
+                        self.set_status("● Running", GREEN_600)
+                        if not hasattr(self, 'is_headless') or not self.is_headless:
+                            webbrowser.open(url)
                         return
-            except:
+            except Exception:
                 pass
             time.sleep(1)
-            retries -= 1
-        self.status_label.config(text="Status: Running (Frontend check failed)")
+        self.set_status("● Running (frontend check failed)", ORANGE_500)
 
-    def restart_all(self):
-        self.backend_manager.stop()
-        self.frontend_manager.stop()
-        self.kill_ports()
-        self.start_backend()
+    def _serve_network(self):
+        try:
+            self.log_webserver(f"✔ Local Network Interface listening on port {NETWORK_INTERFACE_PORT}")
+            HTTPServer(("localhost", NETWORK_INTERFACE_PORT), NetworkHandler).serve_forever()
+        except Exception as e:
+            self.log_webserver(f"✖ Network interface failed: {e}")
 
-    def initial_startup(self):
-        self.kill_ports()
-        self.start_backend()
+
+# ── Headless Launcher ──────────────────────────────────────────────────────────
+class HeadlessLauncher(AppCore):
+    def __init__(self):
+        self.is_headless = True
+        super().__init__("BACKEND", "FRONTEND", self._print_status)
+    
+    def push_log(self, target, line):
+        is_http = bool(_HTTP_LOG_RE.search(line))
+        if target == "BACKEND":
+            if is_http:
+                print(f"\033[96m[BACKEND HTTP]\033[0m {line}")
+            else:
+                print(f"\033[94m[{target}]\033[0m {line}")
+        else:
+            print(f"\033[92m[{target}]\033[0m {line}")
+
+    def log_webserver(self, msg):
+        print(f"\033[95m[WEBSERVER]\033[0m {msg}")
+
+    def _print_status(self, text, color):
+        print(f"\033[93m[STATUS]\033[0m {text}")
+
+    def run(self):
+        print("\033[1m=== AI Optimization Arena (Headless) ===\033[0m")
+        threading.Thread(target=self.startup, daemon=True).start()
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+            self.shutdown()
+
+
+# ── GUI Launcher ───────────────────────────────────────────────────────────────
+class DarkLog(tk.Frame):
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, bg=BG_900, bd=0, highlightthickness=0)
+        self._text = tk.Text(
+            self, bg=BG_900, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
+            selectbackground=BLUE_600, relief="flat", bd=0, font=FONT_MONO,
+            wrap=tk.WORD, state="disabled", padx=8, pady=8, **kwargs,
+        )
+        self._sb = ttk.Scrollbar(self, orient="vertical", command=self._text.yview)
+        self._text.configure(yscrollcommand=self._sb.set)
+        self._sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    def append(self, line: str):
+        self._text.configure(state="normal")
+        self._text.insert(tk.END, line + "\n")
+        self._text.see(tk.END)
+        self._text.configure(state="disabled")
+
+class GUILauncher(AppCore):
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("AI Optimization Arena")
+        self.root.geometry("1100x720")
+        self.root.configure(bg=BG_900)
+        self._apply_dark_title_bar()
+
+        self._q = queue.Queue()
+        self._style_ttk()
+        self._build_ui()
+
+        super().__init__(self.backend_log, self.frontend_log, self._set_status)
+
+        self._drain()
+        self.root.after(100, lambda: threading.Thread(target=self.startup, daemon=True).start())
+
+    def push_log(self, target, line):
+        if target == self.backend_log and _HTTP_LOG_RE.search(line):
+            self._q.put(("log", self.backend_http_log, line))
+        else:
+            self._q.put(("log", target, line))
+
+    def log_webserver(self, msg):
+        self._q.put(("log", self.webserver_log, msg))
+
+    def _set_status(self, text: str, color: str = TEXT_MUTED):
+        self._q.put(("status", text, color))
+
+    def _drain(self):
+        try:
+            while True:
+                msg = self._q.get_nowait()
+                if msg[0] == "log":
+                    msg[1].append(msg[2])
+                elif msg[0] == "status":
+                    self.status_label.config(text=msg[1], fg=msg[2])
+        except queue.Empty:
+            pass
+        self.root.after(50, self._drain)
+
+    def _apply_dark_title_bar(self):
+        if os.name == 'nt':
+            try:
+                import ctypes
+                self.root.update()
+                set_window_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
+                hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+                value = ctypes.c_int(2)
+                set_window_attribute(hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
+            except Exception:
+                pass
+
+    def _style_ttk(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure("TNotebook", background=BG_900, borderwidth=0, tabmargins=0)
+        s.configure("TNotebook.Tab", background=BG_800, foreground=TEXT_MUTED,
+                    padding=[14, 6], font=FONT_UI, borderwidth=0)
+        s.map("TNotebook.Tab", background=[("selected", BG_900)], foreground=[("selected", BLUE_500)])
+        s.configure("TFrame", background=BG_900)
+        
+        s.configure("Vertical.TScrollbar", gripcount=0, background=BG_800, 
+                    darkcolor=BG_900, lightcolor=BG_900, troughcolor=BG_900, 
+                    bordercolor=BG_900, arrowcolor=TEXT_PRIMARY)
+        s.map("Vertical.TScrollbar", background=[("active", BG_700)])
+
+    def _btn(self, parent, text, cmd, bg=BLUE_600, hover=BLUE_500, width=14):
+        btn = tk.Button(parent, text=text, command=cmd, bg=bg, fg=TEXT_PRIMARY,
+                        activebackground=hover, activeforeground=TEXT_PRIMARY,
+                        relief="flat", bd=0, padx=10, pady=6, font=FONT_UI, cursor="hand2", width=width)
+        btn.bind("<Enter>", lambda e: btn.config(bg=hover))
+        btn.bind("<Leave>", lambda e: btn.config(bg=bg))
+        return btn
+
+    def _build_ui(self):
+        tb = tk.Frame(self.root, bg=BG_800, height=52)
+        tb.pack(fill=tk.X)
+        tb.pack_propagate(False)
+        tk.Label(tb, text="⚡  AI Optimization Arena", bg=BG_800, fg=TEXT_PRIMARY,
+                 font=("Segoe UI", 13, "bold")).pack(side=tk.LEFT, padx=16)
+        self.status_label = tk.Label(tb, text="● Initializing", bg=BG_800, fg=TEXT_MUTED, font=("Segoe UI", 9))
+        self.status_label.pack(side=tk.RIGHT, padx=16)
+
+        bar = tk.Frame(self.root, bg=BG_800, height=46)
+        bar.pack(fill=tk.X)
+        bar.pack_propagate(False)
+        row = tk.Frame(bar, bg=BG_800)
+        row.pack(side=tk.LEFT, padx=10, pady=7)
+        
+        self._btn(row, "↺  Restart", lambda: threading.Thread(target=self._async_restart, daemon=True).start(), BLUE_600, BLUE_500, 12).pack(side=tk.LEFT, padx=4)
+        self._btn(row, "🗑  Delete DB", self._ui_delete_db, RED_600, "#EF4444", 12).pack(side=tk.LEFT, padx=4)
+        self._btn(row, "🗑  Delete Cache", self._ui_delete_cache, RED_600, "#EF4444", 14).pack(side=tk.LEFT, padx=4)
+        self._btn(row, "🌐  Open App", lambda: webbrowser.open(f"http://localhost:{FRONTEND_PORT}"), GREEN_600, "#22C55E", 12).pack(side=tk.LEFT, padx=4)
+        self._btn(row, "📡  Ping Server", self._ping_server, BG_700, "#4B5563", 12).pack(side=tk.LEFT, padx=4)
+
+        tk.Frame(self.root, bg=BG_700, height=1).pack(fill=tk.X)
+
+        nb = ttk.Notebook(self.root)
+        nb.pack(expand=True, fill=tk.BOTH)
+
+        self.backend_log      = DarkLog(nb)
+        self.backend_http_log = DarkLog(nb)
+        self.frontend_log     = DarkLog(nb)
+        self.webserver_log    = DarkLog(nb)
+        
+        nb.add(self.backend_log,      text="  Backend  ")
+        nb.add(self.backend_http_log, text="  Backend HTTP  ")
+        nb.add(self.frontend_log,     text="  Frontend  ")
+        nb.add(self.webserver_log,    text="  Webserver  ")
+
+    def _ui_delete_db(self):
+        if messagebox.askyesno("Confirm", "Delete database (arena.db)?\nBackend will stop, DB deleted, then restart."):
+            threading.Thread(target=self._async_delete_db, daemon=True).start()
+
+    def _ui_delete_cache(self):
+        if messagebox.askyesno("Confirm", "Delete problems cache?"):
+            threading.Thread(target=self._async_delete_cache, daemon=True).start()
+
+    def _ping_server(self):
+        def _ping():
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{NETWORK_INTERFACE_PORT}/", timeout=2)
+            except Exception as e:
+                self.log_webserver(f"Ping failed: {e}")
+        threading.Thread(target=_ping, daemon=True).start()
 
     def on_close(self):
-        self.backend_manager.stop()
-        self.frontend_manager.stop()
+        self.shutdown()
         self.root.destroy()
 
+
 if __name__ == "__main__":
-    root = tk.Tk()
-    launcher = ArenaLauncher(root)
-    root.protocol("WM_DELETE_WINDOW", launcher.on_close)
-    root.mainloop()
+    parser = argparse.ArgumentParser(description="AI Optimization Arena Launcher")
+    parser.add_argument("--headless", action="store_true", help="Run without the GUI")
+    args = parser.parse_args()
+
+    if args.headless:
+        HeadlessLauncher().run()
+    else:
+        root = tk.Tk()
+        app = GUILauncher(root)
+        root.protocol("WM_DELETE_WINDOW", app.on_close)
+        root.mainloop()
