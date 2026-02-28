@@ -147,7 +147,7 @@ class TaskConfig:
             if not isinstance(st, dict):
                 continue
                 
-            score = st.get("score", 0.0)
+            score = st.get("points", st.get("score", 0.0))
             try:
                 score = float(score)
             except (ValueError, TypeError):
@@ -163,8 +163,7 @@ class TaskConfig:
                         if inp and outp:
                             patterns.append({"input": inp, "output": outp})
                             
-            if patterns:
-                parsed_subtasks.append({
+            parsed_subtasks.append({
                     "score": score,
                     "patterns": patterns
                 })
@@ -255,7 +254,7 @@ class TaskConfig:
                 # # - path/to/file.cpp
                 # - {path: path/to/file.cpp, ...}
                 # # - {path: path/to/file.cpp, ...}
-                item_matches = re.findall(r"^\s*(?:#\s*)?-\s*(?:\{\s*path:\s*)?([^\s,\}]+)", block, re.MULTILINE)
+                item_matches = re.findall(r"^\s*(?:#\s*)?(?:-\s*)?(?:\{\s*path:\s*)?([^\s#,\}:][^\s,\}:]*\.cpp)", block, re.MULTILINE)
                 for item in item_matches:
                     # Clean up the path and check if it's a C++ file
                     path = item.strip().strip("'").strip('"')

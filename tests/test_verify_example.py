@@ -903,11 +903,11 @@ async def test_verify_example_grader_directory(client, db_session, tmp_path):
     grader_dir = problem_path / "grader"
     grader_dir.mkdir()
     (grader_dir / "grader.cpp").write_text("grader")
-    
+
     with patch("backend.config.PROBLEMS_REPO_DIR", repo_dir), \
          patch("backend.api.verify_example.get_problem_tests_dir", return_value=tmp_path), \
          patch("backend.sandbox.benchmark.compile_and_benchmark", return_value=(True, "OK", None)) as mock_cab:
-        
+
         problem = Problem(
             name="P1", slug="p1-grader-dir", description_md="x", scoring_mode="binary",
             source_url="https://github.com/owner/repo/tree/main/p1",
@@ -915,15 +915,20 @@ async def test_verify_example_grader_directory(client, db_session, tmp_path):
         )
         db_session.add(problem)
         await db_session.commit()
-        
-        # Test regular verify
+
+        # Non-stream endpoint — grader included in additional_files
         await verify_example_solution(problem_id=problem.id, db=db_session)
         assert "grader.cpp" in mock_cab.call_args[1]["additional_files"]
-        
-        # Test stream verify
-        await verify_example_solution_stream(problem_id=problem.id, db=db_session)
-        # Verify call arguments from stream call
-        # ... actually it's easier to just check coverage
+
+        # Stream endpoint — consume the body so event_generator runs and grader is loaded
+        response = await verify_example_solution_stream(problem_id=problem.id, db=db_session)
+        events = []
+        async for line in response.body_iterator:
+            if isinstance(line, bytes):
+                line = line.decode()
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+        assert mock_cab.call_args[1]["additional_files"].get("grader.cpp") == "grader"
 
 def test_find_example_solution_no_keyword(tmp_path):
     problem_dir = tmp_path / "problem"
@@ -989,7 +994,202 @@ def test_parse_github_url_edge_cases():
     assert _parse_github_url("https://github.com/user/repo/") == {
         "owner": "user", "repo": "repo", "ref": "main", "path": ""
     }
+    # Test tree URL
+    assert _parse_github_url("https://github.com/user/repo/tree/main/some/path") == {
+        "owner": "user", "repo": "repo", "ref": "main", "path": "some/path"
+    }
+    # Test blob URL variant — also supported
+    assert _parse_github_url("https://github.com/user/repo/blob/v1.2/sol.cpp") == {
+        "owner": "user", "repo": "repo", "ref": "v1.2", "path": "sol.cpp"
+    }
     # Test invalid URL
     with pytest.raises(Exception) as exc:
         _parse_github_url("https://google.com")
     assert "Cannot parse GitHub URL" in str(exc.value)
+
+
+# =============================================================================
+# Tests for _find_all_solutions — missing branches
+# =============================================================================
+
+def test_find_all_solutions_task_config_no_yaml_file_falls_through_to_scan(tmp_path):
+    """task_config is provided but no task.yaml exists on disk → fall through to dir scan."""
+    problem_dir = tmp_path / "problem"
+    problem_dir.mkdir()
+    (problem_dir / "sol.cpp").write_text("int main() {}")
+    # task_config has data but NO yaml file written to disk
+    task_config = create_mock_task_config(problem_dir, {"name": "test"})
+
+    sols = _find_all_solutions(problem_dir, task_config)
+    assert len(sols) >= 1
+    assert any(s.path == "sol.cpp" for s in sols)
+
+
+def test_find_all_solutions_missing_file_in_test_submissions_skipped(tmp_path):
+    """A path listed in test_submissions that doesn't exist on disk is silently skipped."""
+    problem_dir = tmp_path / "problem"
+    problem_dir.mkdir()
+    (problem_dir / "task.yaml").write_text(
+        "test_submissions:\n"
+        "  solution/exists.cpp: 100\n"
+        "  solution/missing.cpp: 100\n"
+    )
+    (problem_dir / "solution").mkdir()
+    (problem_dir / "solution" / "exists.cpp").write_text("int main() {}")
+    # solution/missing.cpp is NOT created
+
+    task_config = create_mock_task_config(problem_dir, {})
+    sols = _find_all_solutions(problem_dir, task_config)
+
+    assert len(sols) == 1
+    assert sols[0].path == "solution/exists.cpp"
+
+
+def test_find_all_solutions_deduplicates_same_file(tmp_path):
+    """The same absolute path reached via two different SOLUTION_SEARCH_DIRS entries is
+    only included once (seen_paths guard)."""
+    problem_dir = tmp_path / "problem"
+    problem_dir.mkdir()
+    # Create solution/ subdir — it will be found by the "solution" dir entry AND by
+    # the "" (root) entry via rglob. Without dedup it would appear twice.
+    sol_dir = problem_dir / "solution"
+    sol_dir.mkdir()
+    (sol_dir / "main.cpp").write_text("int main() {}")
+
+    sols = _find_all_solutions(problem_dir, None)
+    paths = [s.path for s in sols]
+    assert len(paths) == len(set(paths)), "Duplicate paths found"
+
+
+def test_find_all_solutions_time_limit_and_wrong_answer_dir_names(tmp_path):
+    """Verify both spelling variants for TLE and WA directory verdict inference."""
+    problem_dir = tmp_path / "problem"
+    problem_dir.mkdir()
+
+    (problem_dir / "time_limit").mkdir()
+    (problem_dir / "time_limit" / "slow.cpp").write_text("x")
+
+    (problem_dir / "wrong_answer").mkdir()
+    (problem_dir / "wrong_answer" / "wrong.cpp").write_text("x")
+
+    sols = _find_all_solutions(problem_dir, None)
+    verdicts = {s.path.replace("\\", "/"): s.expected_verdict for s in sols}
+
+    assert verdicts["time_limit/slow.cpp"] == "time_limit"
+    assert verdicts["wrong_answer/wrong.cpp"] == "wrong_answer"
+
+
+# =============================================================================
+# Tests for _get_solution_expected_outcome — empty data dict
+# =============================================================================
+
+def test_get_solution_expected_outcome_empty_data_dict(tmp_path):
+    """task_config.data == {} (falsy but not None) must NOT short-circuit via the guard."""
+    problem_dir = tmp_path / "problem"
+    problem_dir.mkdir()
+    # data={} → no 'solutions' key → isinstance check fails → returns (None, None)
+    # The bug was that `not {}` is True which caused early return before even checking.
+    # After the fix (`data is None`), we reach the isinstance check and return correctly.
+    task_config = create_mock_task_config(problem_dir, {})
+    result = _get_solution_expected_outcome(task_config, problem_dir / "sol.cpp")
+    assert result == (None, None)
+
+
+# =============================================================================
+# Tests for _find_example_solution — directory-based verdict prioritisation
+# =============================================================================
+
+def test_find_example_solution_prefers_correct_dir_over_earlier_root_file(tmp_path):
+    """A file in a correct/ subdirectory should be preferred over an unrelated root file
+    even when the root file appears first in SOLUTION_SEARCH_DIRS order."""
+    problem_dir = tmp_path / "problem"
+    problem_dir.mkdir()
+    # brute.cpp is at the root (found by "" search dir, i.e. rglob from root)
+    (problem_dir / "brute.cpp").write_text("x")
+    # main.cpp is inside correct/ — verdict should cause it to win
+    (problem_dir / "correct").mkdir()
+    (problem_dir / "correct" / "main.cpp").write_text("x")
+
+    sol = _find_example_solution(problem_dir, None)
+    assert sol is not None
+    assert sol.name == "main.cpp"
+    assert "correct" in str(sol)
+
+
+def test_find_example_solution_keyword_in_path_not_just_filename(tmp_path):
+    """Keyword in any path component (not only the filename) should trigger a match."""
+    problem_dir = tmp_path / "problem"
+    problem_dir.mkdir()
+    # File name is "main.cpp" — no keyword in name alone.
+    # But path is "reference/main.cpp" — "reference" IS a keyword.
+    (problem_dir / "reference").mkdir()
+    (problem_dir / "reference" / "main.cpp").write_text("x")
+    (problem_dir / "brute.cpp").write_text("x")  # would win without the fix
+
+    sol = _find_example_solution(problem_dir, None)
+    assert sol is not None
+    assert "reference" in str(sol)
+
+
+# =============================================================================
+# Tests for stream endpoint — grader from task_config
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_verify_example_stream_grader_from_task_config(client, db_session, tmp_path):
+    """Stream endpoint loads grader from task_config just like the non-stream endpoint."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    problem_path = repo_dir / "p1"
+    problem_path.mkdir()
+    (problem_path / "sol.cpp").write_text("int main() {}")
+    (problem_path / "my_grader.cpp").write_text("grader content")
+    (problem_path / "task.yaml").write_text(
+        "solutions:\n  - sol.cpp\ngrader: my_grader.cpp"
+    )
+
+    with patch("backend.config.PROBLEMS_REPO_DIR", repo_dir), \
+         patch("backend.api.verify_example.get_problem_tests_dir", return_value=tmp_path), \
+         patch("backend.sandbox.benchmark.compile_and_benchmark",
+               return_value=(True, "OK", None)) as mock_cab:
+
+        problem = Problem(
+            name="P1", slug="p1-stream-grader-task", description_md="x", scoring_mode="binary",
+            source_url="https://github.com/owner/repo/tree/main/p1",
+            tests_downloaded=True
+        )
+        db_session.add(problem)
+        await db_session.commit()
+
+        response = await verify_example_solution_stream(problem_id=problem.id, db=db_session)
+        async for _ in response.body_iterator:
+            pass  # drain so event_generator runs to completion
+
+        assert "my_grader.cpp" in mock_cab.call_args[1]["additional_files"]
+        assert mock_cab.call_args[1]["additional_files"]["my_grader.cpp"] == "grader content"
+
+
+# =============================================================================
+# Tests for _find_all_solutions — task_yaml with mapping format (ceoi2022 style)
+# =============================================================================
+
+def test_find_all_solutions_mapping_format_test_submissions(tmp_path):
+    """task.yaml test_submissions in mapping format (sol.cpp: score) — real ceoi2022 style."""
+    problem_dir = tmp_path / "problem"
+    problem_dir.mkdir()
+    (problem_dir / "task.yaml").write_text(
+        "test_submissions:\n"
+        "  # solution/commented.cpp: 100\n"
+        "  solution/active.cpp: 100\n"
+    )
+    (problem_dir / "solution").mkdir()
+    (problem_dir / "solution" / "active.cpp").write_text("int main() {}")
+    (problem_dir / "solution" / "commented.cpp").write_text("int main() {}")
+
+    task_config = create_mock_task_config(problem_dir, {})
+    sols = _find_all_solutions(problem_dir, task_config)
+
+    paths = {s.path for s in sols}
+    assert "solution/active.cpp" in paths
+    assert "solution/commented.cpp" in paths
+    assert len(sols) == 2

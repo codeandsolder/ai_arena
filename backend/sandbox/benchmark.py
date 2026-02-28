@@ -510,6 +510,8 @@ async def _store_results(
         raise
 
 
+import shutil
+
 async def _run_task_maker(
     solution_id: int,
     source_code: str,
@@ -520,53 +522,76 @@ async def _run_task_maker(
 ) -> BenchmarkSummary:
     """
     Run evaluation using Task Maker CLI (tmc).
-    
-    Args:
-        solution_id: Solution ID
-        source_code: C++ source code
-        problem_dir: Directory containing task.yaml
-        memory_limit_mb: Memory limit
-        db_session: Optional database session
-        progress_callback: Optional async callback for intermediate results
-        
-    Returns:
-        BenchmarkSummary
     """
     logger.info(f"Using Task Maker for solution {solution_id}")
     container_manager = get_container_manager()
     
+    # 1. Find the repository root by looking upwards for a TMC base file
+    problem_path = Path(problem_dir).absolute()
+    repo_root = problem_path
+    current = problem_path
+    base_file = None
+    
+    while current != current.parent:
+        if (current / "base-batch.yaml").exists():
+            repo_root = current
+            base_file = "base-batch.yaml"
+            break
+        elif (current / "base.yaml").exists():
+            repo_root = current
+            base_file = "base.yaml"
+            break
+        current = current.parent
+        
+    # 2. Set up an isolated temporary workspace so TMC doesn't pollute the host repo
     with tempfile.TemporaryDirectory() as temp_dir:
-        source_path = os.path.join(temp_dir, "solution.cpp")
-        with open(source_path, "w") as f:
+        temp_repo = Path(temp_dir)
+        
+        # Copy base configuration file to the temp repo root
+        if base_file:
+            shutil.copy2(repo_root / base_file, temp_repo / base_file)
+            
+        # Copy the task directory to temp_repo/task
+        temp_task_dir = temp_repo / "task"
+        shutil.copytree(problem_path, temp_task_dir)
+        
+        # Write the solution directly inside the task directory
+        solution_filename = "sandbox_solution.cpp"
+        source_path = temp_task_dir / solution_filename
+        with open(source_path, "w", encoding="utf-8") as f:
             f.write(source_code)
             
-        # Mount problem_dir to /task and source file to /sandbox/solution.cpp
+        # Mount the temp repo as RW (TMC compiles binaries and writes caches)
         volumes = {
-            os.path.abspath(problem_dir): {"bind": "/task", "mode": "rw"},
-            os.path.abspath(source_path): {"bind": "/sandbox/solution.cpp", "mode": "ro"}
+            str(temp_repo.absolute()): {"bind": "/repo", "mode": "rw"}
         }
         
-        # Execute tmc evaluate
-        # Use working_dir parameter instead of sh -c to change directory
-        command = ["tmc", "evaluate", "--ui", "json", "/sandbox/solution.cpp"]
+        command = ["tmc", "evaluate", "--ui", "json", solution_filename]
         
-        result = await container_manager.execute_command(
+        # Note: We manually create and run the container here because the 
+        # execute_command helper ignores working_dir, cap_add, and read_only flags.
+        container = await container_manager.create_container(
             command=command,
             volumes=volumes,
-            mem_limit=f"{memory_limit_mb + 256}m",  # Extra memory for tmc/compilation
-            timeout=300,
+            mem_limit=f"{memory_limit_mb + 512}m",
             network_disabled=True,
-            working_dir="/task"
+            working_dir="/repo/task",      # Explicitly set the working directory
+            read_only=False,               # TMC needs write permissions here
+            cap_add=["SYS_ADMIN"]          # Isolate requires SYS_ADMIN capability
         )
         
+        try:
+            result = await container_manager.run_container(container, timeout=300)
+        finally:
+            await container_manager.cleanup_container(container)
+            
         if not result.success and not result.stdout:
-             raise BenchmarkError(f"Task Maker execution failed: {result.error or 'Unknown error'}")
+             raise BenchmarkError(f"Task Maker execution failed: {result.error or 'Unknown error'}\nStderr: {result.stderr}")
 
         # Parse tmc output (multiple JSON objects)
         test_results: List[TestCaseResult] = []
         final_summary = None
         
-        # tmc --ui json outputs multiple JSON objects separated by newlines
         for line in result.stdout.splitlines():
             line = line.strip()
             if not line:
@@ -578,8 +603,6 @@ async def _run_task_maker(
                 # Check for individual test results
                 if "IOITestcaseScore" in msg:
                     data = msg["IOITestcaseScore"]
-                    # Map to TestCaseResult
-                    # The test name might be something like 'test01'
                     test_name = data.get("test_name", f"test_{len(test_results)+1}")
                     passed = data.get("score", 0.0) > 0.0 or data.get("verdict") == "Correct"
                     
@@ -599,7 +622,6 @@ async def _run_task_maker(
                         test_name=test_name,
                         passed=passed,
                         actual_output="",
-                        # tmc usually gives time in seconds for 'time' or 'cpu_time'
                         time_ms=(data.get("time") or data.get("cpu_time") or 0.0) * 1000.0,
                         memory_kb=data.get("memory", 0) // 1024, # B to KB
                         exit_code=0 if passed else -1,
@@ -609,7 +631,10 @@ async def _run_task_maker(
                     test_results.append(tc_result)
                     
                     if progress_callback:
-                        await progress_callback(tc_result)
+                        try:
+                            await progress_callback(tc_result)
+                        except Exception as e:
+                            logger.warning(f"Progress callback failed: {e}")
                     
                 # Check for evaluation summary
                 elif "IOIEvaluation" in msg:
@@ -619,10 +644,9 @@ async def _run_task_maker(
                 continue
         
         if not test_results:
-             # Check if there was a compilation error in stdout/stderr
              if "Compilation error" in result.stdout or "Compilation error" in result.stderr:
                  raise BenchmarkError(f"Compilation failed under Task Maker:\n{result.stdout}\n{result.stderr}")
-             raise BenchmarkError(f"Task Maker produced no test results. Output: {result.stdout[:500]}")
+             raise BenchmarkError(f"Task Maker produced no test results. Output: {result.stdout[:500]} Stderr: {result.stderr[:500]}")
 
         # Aggregate summary
         tests_total = len(test_results)
@@ -640,7 +664,6 @@ async def _run_task_maker(
         if final_summary:
             score = final_summary.get("score", 0.0)
         else:
-            # Fallback proportional scoring
             score = (tests_passed / tests_total * 100.0) if tests_total > 0 else 0.0
 
         summary = BenchmarkSummary(
@@ -655,7 +678,6 @@ async def _run_task_maker(
             test_results=test_results
         )
         
-        # Store results in database
         await _store_results(summary, test_results, db_session)
         
         return summary

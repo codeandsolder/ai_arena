@@ -6,8 +6,6 @@ runs it against all test cases, and returns the results.
 """
 
 import logging
-import tempfile
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -92,10 +90,14 @@ def _find_example_solution(problem_path: Path, task_config=None) -> Optional[Pat
 
     all_sols = _find_all_solutions(problem_path, task_config)
     if all_sols:
-        # Prefer "correct" or "sol" or "reference" in the name
+        # Prefer by verdict first (set from directory name during fallback scan), then
+        # by keywords in any part of the path (handles e.g. correct/main.cpp where the
+        # filename alone doesn't contain the keyword).
         for sol in all_sols:
-            name = sol.name.lower()
-            if any(kw in name for kw in ["correct", "sol", "reference", "example", "ac"]):
+            if sol.expected_verdict == "correct":
+                return problem_path / sol.path
+            path_lower = sol.path.lower().replace("\\", "/")
+            if any(kw in path_lower for kw in ["correct", "sol", "reference", "example", "ac"]):
                 return problem_path / sol.path
         return problem_path / all_sols[0].path
     return None
@@ -103,7 +105,7 @@ def _find_example_solution(problem_path: Path, task_config=None) -> Optional[Pat
 
 def _get_solution_expected_outcome(task_config, solution_path: Path):
     """Try to find expected score/verdict for a solution in task.yaml."""
-    if not task_config or not task_config.data:
+    if not task_config or task_config.data is None:
         return None, None
 
     solutions = task_config.data.get("solutions")
@@ -134,14 +136,12 @@ def _find_all_solutions(problem_path: Path, task_config=None) -> List[SolutionIn
 
     # 1. Check for test_submissions list in task.yaml (includes commented out ones)
     if task_config:
-        # Check if the YAML file exists at all. get_test_submissions returns [] if it doesn't
-        # exist OR if it's explicitly empty.
-        # But we need to know if it exists to decide whether to fall back.
-        yaml_exists = False
-        for filename in ["task.yaml", "tasks.yaml", "task.yml", "tasks.yml"]:
-            if (task_config.problem_dir / filename).exists():
-                yaml_exists = True
-                break
+        # Use problem_path (not task_config.problem_dir) so the yaml existence check is
+        # consistent with how solution files are resolved: p = problem_path / rel_path.
+        yaml_exists = any(
+            (problem_path / fn).exists()
+            for fn in ["task.yaml", "tasks.yaml", "task.yml", "tasks.yml"]
+        )
         
         if yaml_exists:
             test_submissions = task_config.get_test_submissions()
@@ -260,7 +260,6 @@ async def verify_example_solution(
     If request.solution_path is provided, verifies that specific solution.
     Otherwise, picks the best one from task.yaml or standard locations.
     """
-    # Load problem
     result = await db.execute(select(Problem).where(Problem.id == problem_id))
     problem = result.scalar_one_or_none()
     if problem is None:
@@ -278,93 +277,18 @@ async def verify_example_solution(
             detail="Tests have not been downloaded yet. Sync tests first.",
         )
 
-    # Resolve problem path in the local repo
-    if not config.PROBLEMS_REPO_DIR.exists():
-        raise HTTPException(
-            status_code=400,
-            detail="Local problem repository (PROBLEMS_REPO_DIR) is not configured.",
-        )
-
-    parsed = _parse_github_url(problem.source_url)
-    problem_local_path = config.PROBLEMS_REPO_DIR / parsed["path"]
-
-    if not problem_local_path.is_dir():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Local problem directory not found: {problem_local_path}",
-        )
-
-    # Parse task.yaml if present
-    task_config = parse_task_yaml(problem_local_path)
-
-    # Find solution file
-    solution_file = None
-    if request and request.solution_path:
-        solution_file = problem_local_path / request.solution_path
-        if not solution_file.exists():
-            raise HTTPException(
-                status_code=404,
-                detail=f"Solution file not found: {request.solution_path}",
-            )
-    else:
-        # Default behavior: find best solution
-        if task_config:
-            solution_file = task_config.get_correct_solution()
-            if solution_file:
-                logger.info(f"Found solution from task.yaml: {solution_file}")
-
-        if not solution_file:
-            # Re-use _find_all_solutions and pick the first one (which would be the previous behavior)
-            all_sols = _find_all_solutions(problem_local_path, task_config)
-            if all_sols:
-                solution_file = problem_local_path / all_sols[0].path
-
-    if solution_file is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No .cpp solution file found in {problem_local_path}."
-            ),
-        )
-
-    expected_score, expected_verdict = _get_solution_expected_outcome(task_config, solution_file)
+    problem_local_path, solution_file, expected_score, expected_verdict, additional_files = \
+        _resolve_verify_context(problem, request)
 
     logger.info(f"Verifying solution for problem {problem_id}: {solution_file}")
-
-    # Check for grader files
-    additional_files = {}
-    grader_files = []
-
-    if task_config:
-        grader_files = task_config.get_grader_files()
-        if grader_files:
-            logger.info(f"Found grader files from task.yaml: {[f.name for f in grader_files]}")
-
-    # If no task_config or no grader files found in task.yaml, fallback to legacy grader dir check
-    if not grader_files:
-        grader_dir = problem_local_path / "grader"
-        if grader_dir.is_dir():
-            grader_files = list(grader_dir.glob("*"))
-            logger.info(f"Found grader directory with files: {[f.name for f in grader_files if f.is_file()]}")
-        else:
-            logger.info(f"No grader directory found at {grader_dir}")
-
-    for f in grader_files:
-        if f.is_file():
-            # Basic sanity check: only include source/header files
-            if f.suffix in [".cpp", ".h", ".hpp", ".c"]:
-                additional_files[f.name] = f.read_text(encoding="utf-8")
 
     source_code = solution_file.read_text(encoding="utf-8")
     tests_dir = get_problem_tests_dir(problem_id)
 
-    # Compile + benchmark using the existing pipeline
+    # Compile + benchmark using the existing pipeline.
+    # Use a throwaway solution_id sentinel (-problem_id) so we don't pollute the Solution
+    # table. compile_and_benchmark updates Solution rows by ID; a negative ID won't match.
     from backend.sandbox.benchmark import compile_and_benchmark
-
-    # Use a throwaway solution_id sentinel (-problem_id) so we don't pollute
-    # the Solution table. compile_and_benchmark updates Solution rows by ID,
-    # so we give it a dummy that won't match any real row and catch the
-    # harmless DB miss below.
     DUMMY_SOLUTION_ID = -(problem_id)
 
     try:
@@ -447,7 +371,6 @@ async def verify_example_solution_stream(
     """
     Compile and benchmark a solution for a problem, streaming results via SSE.
     """
-    # Load problem
     result = await db.execute(select(Problem).where(Problem.id == problem_id))
     problem = result.scalar_one_or_none()
     if problem is None:
@@ -465,69 +388,8 @@ async def verify_example_solution_stream(
             detail="Tests have not been downloaded yet. Sync tests first.",
         )
 
-    # Resolve problem path in the local repo
-    if not config.PROBLEMS_REPO_DIR.exists():
-        raise HTTPException(
-            status_code=400,
-            detail="Local problem repository (PROBLEMS_REPO_DIR) is not configured.",
-        )
-
-    parsed = _parse_github_url(problem.source_url)
-    problem_local_path = config.PROBLEMS_REPO_DIR / parsed["path"]
-
-    if not problem_local_path.is_dir():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Local problem directory not found: {problem_local_path}",
-        )
-
-    # Parse task.yaml if present
-    task_config = parse_task_yaml(problem_local_path)
-
-    # Find solution file
-    solution_file = None
-    if request and request.solution_path:
-        solution_file = problem_local_path / request.solution_path
-        if not solution_file.exists():
-            raise HTTPException(
-                status_code=404,
-                detail=f"Solution file not found: {request.solution_path}",
-            )
-    else:
-        # Default behavior: find best solution
-        if task_config:
-            solution_file = task_config.get_correct_solution()
-            if solution_file:
-                logger.info(f"Found solution from task.yaml: {solution_file}")
-
-        if not solution_file:
-            # Re-use _find_all_solutions and pick the first one
-            all_sols = _find_all_solutions(problem_local_path, task_config)
-            if all_sols:
-                solution_file = problem_local_path / all_sols[0].path
-
-    if solution_file is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No .cpp solution file found in {problem_local_path}.",
-        )
-
-    expected_score, expected_verdict = _get_solution_expected_outcome(task_config, solution_file)
-
-    # Check for grader files
-    additional_files = {}
-    grader_files = []
-    if task_config:
-        grader_files = task_config.get_grader_files()
-
-    if not grader_files:
-        grader_dir = problem_local_path / "grader"
-        if grader_dir.is_dir():
-            grader_files = list(grader_dir.glob("*"))
-
-    for f in grader_files:
-        if f.is_file() and f.suffix in [".cpp", ".h", ".hpp", ".c"]:
-            additional_files[f.name] = f.read_text(encoding="utf-8")
+    problem_local_path, solution_file, expected_score, expected_verdict, additional_files = \
+        _resolve_verify_context(problem, request)
 
     source_code = solution_file.read_text(encoding="utf-8")
     tests_dir = get_problem_tests_dir(problem_id)
@@ -553,7 +415,7 @@ async def verify_example_solution_stream(
 
         # Run compilation and benchmarking in a separate task
         DUMMY_SOLUTION_ID = -(problem_id)
-        
+
         benchmark_task = asyncio.create_task(compile_and_benchmark(
             solution_id=DUMMY_SOLUTION_ID,
             source_code=source_code,
@@ -585,7 +447,7 @@ async def verify_example_solution_stream(
         # Final summary
         try:
             success, message, summary = await benchmark_task
-            
+
             if not success or summary is None:
                 final_resp = {
                     "type": "final",
@@ -645,7 +507,8 @@ async def verify_example_solution_stream(
 
 
 def _parse_github_url(url: str) -> dict:
-    """Minimal URL parser (duplicates IOIIngestor.parse_github_url without needing an instance)."""
+    # TODO: deduplicate with IOIIngestor.parse_github_url into a shared utils module.
+    """Minimal URL parser (mirrors IOIIngestor.parse_github_url without needing an instance)."""
     import re
     repo_only = re.match(r"https://github\.com/([^/]+)/([^/]+)/?$", url)
     if repo_only:
@@ -656,3 +519,80 @@ def _parse_github_url(url: str) -> dict:
     if not m:
         raise HTTPException(status_code=400, detail=f"Cannot parse GitHub URL: {url}")
     return {"owner": m.group(1), "repo": m.group(2), "ref": m.group(3), "path": m.group(4)}
+
+
+def _resolve_verify_context(problem: "Problem", request: Optional[VerifyRequest]):
+    """
+    Shared setup for both verify endpoints.
+
+    Validates PROBLEMS_REPO_DIR, resolves the local problem directory, parses task.yaml,
+    resolves which solution file to use, and loads any grader files into additional_files.
+
+    Returns:
+        (problem_local_path, solution_file, expected_score, expected_verdict, additional_files)
+
+    Raises:
+        HTTPException 400/404 on any validation failure.
+    """
+    if not config.PROBLEMS_REPO_DIR.exists():
+        raise HTTPException(
+            status_code=400,
+            detail="Local problem repository (PROBLEMS_REPO_DIR) is not configured.",
+        )
+
+    parsed = _parse_github_url(problem.source_url)
+    problem_local_path = config.PROBLEMS_REPO_DIR / parsed["path"]
+
+    if not problem_local_path.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Local problem directory not found: {problem_local_path}",
+        )
+
+    task_config = parse_task_yaml(problem_local_path)
+
+    # --- Resolve solution file ---
+    solution_file = None
+    if request and request.solution_path:
+        solution_file = problem_local_path / request.solution_path
+        if not solution_file.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Solution file not found: {request.solution_path}",
+            )
+    else:
+        if task_config:
+            solution_file = task_config.get_correct_solution()
+            if solution_file:
+                logger.info(f"Found solution from task.yaml: {solution_file}")
+        if not solution_file:
+            all_sols = _find_all_solutions(problem_local_path, task_config)
+            if all_sols:
+                solution_file = problem_local_path / all_sols[0].path
+
+    if solution_file is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No .cpp solution file found in {problem_local_path}.",
+        )
+
+    expected_score, expected_verdict = _get_solution_expected_outcome(task_config, solution_file)
+
+    # --- Load grader files ---
+    additional_files: dict = {}
+    grader_files = task_config.get_grader_files() if task_config else []
+    if grader_files:
+        logger.info(f"Found grader files from task.yaml: {[f.name for f in grader_files]}")
+    else:
+        grader_dir = problem_local_path / "grader"
+        if grader_dir.is_dir():
+            grader_files = list(grader_dir.glob("*"))
+            logger.info(f"Found grader directory with files: {[f.name for f in grader_files if f.is_file()]}")
+        else:
+            logger.info(f"No grader directory found at {grader_dir}")
+
+    for f in grader_files:
+        if f.is_file() and f.suffix in [".cpp", ".h", ".hpp", ".c"]:
+            additional_files[f.name] = f.read_text(encoding="utf-8")
+
+    return problem_local_path, solution_file, expected_score, expected_verdict, additional_files

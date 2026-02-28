@@ -202,6 +202,41 @@ def test_get_subtasks_and_patterns(tmp_path):
     assert patterns[1] == {"input": "2.in", "output": "2.out"}
     assert patterns[2] == {"input": "4.in", "output": "4.out"}
 
+
+def test_get_subtasks_points_key(tmp_path):
+    """'points' is the primary key used by real IOI task.yaml files (e.g. ceoi2022)."""
+    data = {
+        "subtasks": [
+            {"points": 0,   "testcases": [{"input": "0-*.in", "output": "0-*.out"}]},
+            {"points": 10,  "testcases": [{"input": "1-*.in", "output": "1-*.out"}]},
+            {"points": 40,  "testcases": [{"input": "2-*.in", "output": "2-*.out"}]},
+            {"points": "25", "testcases": [{"input": "3-*.in", "output": "3-*.out"}]},
+        ]
+    }
+    config = TaskConfig(data, tmp_path)
+    subtasks = config.get_subtasks()
+
+    assert len(subtasks) == 4
+    assert subtasks[0]["score"] == 0.0
+    assert subtasks[1]["score"] == 10.0
+    assert subtasks[2]["score"] == 40.0
+    assert subtasks[3]["score"] == 25.0
+    # Total = 75 (0 is the sample subtask)
+    non_zero = [s["score"] for s in subtasks if s["score"] > 0]
+    assert sum(non_zero) == 75.0
+
+
+def test_get_subtasks_points_takes_priority_over_score(tmp_path):
+    """When both 'points' and 'score' are present, 'points' wins."""
+    data = {
+        "subtasks": [
+            {"points": 60, "score": 40, "testcases": [{"input": "1.in", "output": "1.out"}]},
+        ]
+    }
+    config = TaskConfig(data, tmp_path)
+    subtasks = config.get_subtasks()
+    assert subtasks[0]["score"] == 60.0
+
 def test_get_subtasks_invalid(tmp_path):
     config = TaskConfig({"subtasks": "not a list"}, tmp_path)
     assert config.get_subtasks() == []
@@ -263,6 +298,24 @@ other_key: value
     assert "path/to/sol4.cpp" in submissions
     assert "sol5.cpp" in submissions
     assert "other.py" not in submissions
+
+
+def test_get_test_submissions_mapping_format(tmp_path):
+    """Mapping format used by real IOI repos: `solution/foo.cpp: 100` (no leading dash)."""
+    yaml_file = tmp_path / "task.yaml"
+    yaml_file.write_text(
+        "test_submissions:\n"
+        "  # solution/commented.cpp: 100\n"
+        "  solution/active.cpp: 100\n"
+        "  solution/partial.cpp: 50\n"
+    )
+    config = TaskConfig({}, tmp_path)
+    submissions = config.get_test_submissions()
+
+    assert len(submissions) == 3
+    assert "solution/commented.cpp" in submissions
+    assert "solution/active.cpp" in submissions
+    assert "solution/partial.cpp" in submissions
 
 def test_get_test_submissions_explicit_empty(tmp_path):
     yaml_file = tmp_path / "task.yaml"

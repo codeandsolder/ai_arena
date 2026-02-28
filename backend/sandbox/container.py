@@ -342,15 +342,17 @@ class ContainerManager:
             logger.warning(f"Failed to cleanup container: {e}")
     
     async def execute_command(
-        self,
-        command: List[str],
-        volumes: Optional[Dict[str, Dict[str, str]]] = None,
-        mem_limit: str = DEFAULT_MEMORY_LIMIT,
-        cpu_quota: int = DEFAULT_CPU_QUOTA,
-        timeout: int = DEFAULT_TIMEOUT,
-        network_disabled: bool = True,
-        working_dir: Optional[str] = "/workspace"
-    ) -> ContainerResult:
+    self,
+    command: List[str],
+    volumes: Optional[Dict[str, Dict[str, str]]] = None,
+    mem_limit: str = DEFAULT_MEMORY_LIMIT,
+    cpu_quota: int = DEFAULT_CPU_QUOTA,
+    timeout: int = DEFAULT_TIMEOUT,
+    network_disabled: bool = True,
+    working_dir: str = "/workspace",
+    read_only: bool = True,
+    cap_add: Optional[List[str]] = None
+) -> ContainerResult:
         """
         Execute a command in a new container and clean up afterwards.
         
@@ -370,12 +372,15 @@ class ContainerManager:
         container = None
         try:
             container = await self.create_container(
-                command=command,
-                volumes=volumes,
-                mem_limit=mem_limit,
-                cpu_quota=cpu_quota,
-                network_disabled=network_disabled
-            )
+        command=command,
+        volumes=volumes,
+        mem_limit=mem_limit,
+        cpu_quota=cpu_quota,
+        network_disabled=network_disabled,
+        working_dir=working_dir,  # Make sure this is passed!
+        read_only=read_only,
+        cap_add=cap_add
+    )
             
             result = await self.run_container(container, timeout=timeout)
             return result
