@@ -26,7 +26,7 @@ NETWORK_INTERFACE_PORT = 8001
 BASE_DIR         = Path(__file__).parent.resolve()
 BACKEND_DIR      = BASE_DIR
 FRONTEND_DIR     = BASE_DIR / "frontend"
-DATA_DIR         = BASE_DIR / "backend" / "data"
+DATA_DIR         = BASE_DIR / "backend" / "data"/ "problems"
 DATABASE_PATH    = DATA_DIR / "arena.db"
 PROBLEMS_DIR     = DATA_DIR / "problems"
 

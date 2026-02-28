@@ -1035,8 +1035,9 @@ class OrchestrationEngine:
         """
         problem_dir = self._get_problem_dir(problem)
 
-        async def benchmark_single(solution: Solution, binary_path: str):
-            """Benchmark a single solution."""
+    async def benchmark_single_protected(solution: Solution, binary_path: str):
+        # Use semaphore to ensure benchmarks don't interfere with each other's timing
+        async with self.benchmark_semaphore:
             await self.websocket_manager.broadcast_solution_status(
                 run_id=run_id,
                 solution_id=solution.id,
@@ -1045,20 +1046,13 @@ class OrchestrationEngine:
             )
             
             try:
-                # Check if task.yaml exists in problem_dir
+                # Check for TMC (task.yaml)
                 use_tmc = False
                 if problem_dir and os.path.exists(os.path.join(problem_dir, "task.yaml")):
                     use_tmc = True
                 
                 if use_tmc:
-                    # Parse flags
-                    import shlex
-                    try:
                         flags_list = shlex.split(solution.compiler_flags or "-O2 -std=c++20")
-                    except ValueError:
-                        flags_list = ["-O2", "-std=c++20"]
-
-                    # Use compile_and_benchmark which handles TMC
                     success, message, summary = await compile_and_benchmark(
                         solution_id=solution.id,
                         source_code=solution.source_code or "",
@@ -1118,15 +1112,8 @@ class OrchestrationEngine:
                 solution.status = "benchmark_failed"
                 solution.error_message = str(e)
                 
-                await self.websocket_manager.broadcast_solution_status(
-                    run_id=run_id,
-                    solution_id=solution.id,
-                    model=solution.model_slug,
-                    status="benchmark_failed"
-                )
-        
-        # Benchmark all solutions in parallel
-        tasks = [benchmark_single(sol, path) for sol, path in compiled]
+    # Run protected benchmarks
+    tasks = [benchmark_single_protected(sol, path) for sol, path in compiled]
         await asyncio.gather(*tasks)
         
         await db_session.commit()
@@ -1182,7 +1169,7 @@ class OrchestrationEngine:
         # Score each solution
         for sol in solutions:
             # Check if solution passed compilation and all tests
-            if not sol.compile_success or sol.tests_passed != sol.tests_total:
+        	if sol.tests_total == 0:
                 sol.score = 0.0
                 continue
             

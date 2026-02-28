@@ -2,13 +2,15 @@ import os
 import tempfile
 import pytest
 import asyncio
-from backend.sandbox.container import ContainerManager
+from backend.sandbox.container import ContainerManager 
+from backend.sandbox.benchmark import compile_and_benchmark
+
 
 @pytest.mark.asyncio
 async def test_tmc_execution():
     """
     Verifies that 'tmc' is installed and executable in the sandbox container.
-    This test ensures that the Docker image build (v2) correctly included tmc.
+    This test ensures that the Docker image build correctly included tmc.
     """
     manager = ContainerManager()
     
@@ -20,7 +22,6 @@ async def test_tmc_execution():
         command = ["tmc", "--version"]
         
         # We need to ensure the image is built/available
-        # This might take a while on the first run after changing tag to v2
         await manager.ensure_image_available()
         
         container = await manager.create_container(
@@ -130,6 +131,74 @@ async def test_tmc_task_grading():
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: container.remove(force=True))
 
-if __name__ == "__main__":
-    # Allow running this script directly
-    asyncio.run(test_tmc_execution())
+
+@pytest.mark.asyncio
+async def test_official_workflow_tmc_integration():
+    """
+    Integration test for the official pipeline.
+    Passes source code to `compile_and_benchmark`, which should detect task.yaml, 
+    route to `_run_task_maker`, patch the YAML, and execute successfully via Docker.
+    """
+    import os
+    import shutil
+    import tempfile
+    
+    repo_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "backend", "data", "problems_repo")
+    if not os.path.exists(repo_dir):
+        pytest.skip(f"Problems repo not found at {repo_dir}")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # 1. Setup a realistic problem structure
+        shutil.copy2(os.path.join(repo_dir, "base-batch.yaml"), os.path.join(temp_dir, "base-batch.yaml"))
+        
+        task_dir = os.path.join(temp_dir, "task")
+        shutil.copytree(os.path.join(repo_dir, "ceoi2022-abracadabra"), task_dir)
+        
+        # Clean up all test cases except 0-01 to make the test run fast
+        tc_dir = os.path.join(task_dir, "tc")
+        for f in os.listdir(tc_dir):
+            if f not in ["0-01.in.gz", "0-01.out.gz"]:
+                os.remove(os.path.join(tc_dir, f))
+                
+        # Read the known correct solution
+        sol_path = os.path.join(task_dir, "solution", "deu-lukas-michel.cpp")
+        with open(sol_path, "r", encoding="utf-8") as f:
+            source_code = f.read()
+
+        # compile_and_benchmark requires a test_cases_dir argument (even though TMC ignores it)
+        dummy_tests_dir = os.path.join(temp_dir, "dummy_tests")
+        os.makedirs(dummy_tests_dir)
+
+        # 2. Execute the official workflow!
+        success, msg, summary = await compile_and_benchmark(
+            solution_id=-999,
+            source_code=source_code,
+            compiler="g++-14",
+            compiler_flags=["-O2", "-std=c++17"],
+            test_cases_dir=dummy_tests_dir,
+            problem_id=1,
+            time_limit_ms=3000,
+            memory_limit_mb=512,
+            benchmark_runs=1,
+            warmup_runs=0,
+            db_session=None,
+            problem_dir=task_dir
+        )
+
+        # 3. Verify the pipeline handled everything automatically
+        assert success is True, f"Benchmark failed with message: {msg}"
+        assert summary is not None, "Benchmark summary is None"
+        
+        # We kept exactly 1 test case
+        assert summary.tests_total == 1, f"Expected 1 test total, got {summary.tests_total}"
+        assert summary.tests_passed == 1, "Expected the test case to pass"
+        assert summary.all_passed is True, "all_passed should be True"
+        
+        # Verify JSON parsed correctly into TestCaseResult
+        test_result = summary.test_results[0]
+        assert test_result.passed is True
+        assert test_result.verdict == "AC"
+        assert test_result.time_ms > 0, "Time tracking failed"
+        assert test_result.memory_kb > 0, "Memory tracking failed"
+        
+        print("Official TMC Workflow test passed seamlessly!")

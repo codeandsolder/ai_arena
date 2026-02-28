@@ -1193,3 +1193,83 @@ def test_find_all_solutions_mapping_format_test_submissions(tmp_path):
     assert "solution/active.cpp" in paths
     assert "solution/commented.cpp" in paths
     assert len(sols) == 2
+
+import pytest
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+@pytest.mark.asyncio
+async def test_run_task_maker_yaml_patching(tmp_path):
+    from backend.sandbox.benchmark import _run_task_maker
+    from backend.sandbox.container import ContainerResult
+    
+    # 1. Setup a fake problem directory with a messy task.yaml
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "base-batch.yaml").write_text("")
+    
+    problem_dir = repo_root / "task1"
+    problem_dir.mkdir()
+    
+    # This simulates the human-readable formats that crash tmc
+    original_yaml = "time_limit: 3.5s\nmemory_limit: 256MiB\nlong_name: Test Task\n"
+    (problem_dir / "task.yaml").write_text(original_yaml)
+    
+    # We will store the patched content here during the mock execution
+    captured_data = {}
+    
+    # 2. Mock the Docker container lifecycle
+    async def mock_create_container(command, volumes, **kwargs):
+        # The temp_repo path is the only host path mounted in the volumes dict
+        temp_repo_path = list(volumes.keys())[0]
+        patched_yaml_path = Path(temp_repo_path) / "task" / "task.yaml"
+        
+        # Capture the file content right before the "container" runs
+        if patched_yaml_path.exists():
+            captured_data["task.yaml"] = patched_yaml_path.read_text(encoding="utf-8")
+        
+        return "mocked_container"
+        
+    async def mock_run_container(container, timeout):
+        # Return a fake successful tmc evaluation including at least one test case
+        fake_stdout = (
+            '{"IOITestcaseScore": {"test_name": "test1", "score": 1.0, "verdict": "Correct", "time": 0.1, "memory": 10240}}\n'
+            '{"IOIEvaluation": {"score": 100.0}}'
+        )
+        return ContainerResult(
+            success=True, 
+            stdout=fake_stdout, 
+            stderr="", 
+            exit_code=0, 
+            execution_time_ms=100
+        )
+        
+    async def mock_cleanup(container):
+        pass
+        
+    # 3. Inject our mocks and run the function
+    with patch("backend.sandbox.benchmark.get_container_manager") as mock_get_cm:
+        mock_cm = MagicMock()
+        mock_cm.create_container.side_effect = mock_create_container
+        mock_cm.run_container.side_effect = mock_run_container
+        mock_cm.cleanup_container.side_effect = mock_cleanup
+        mock_get_cm.return_value = mock_cm
+        
+        await _run_task_maker(
+            solution_id=1, 
+            source_code="int main() {}", 
+            problem_dir=str(problem_dir)
+        )
+        
+    # 4. Assert that the patching worked beautifully
+    assert "task.yaml" in captured_data, "task.yaml was not found in the temp directory"
+    patched_content = captured_data["task.yaml"]
+    
+    assert "time_limit: 3.5\n" in patched_content
+    assert "memory_limit: 256\n" in patched_content
+    assert "title: Test Task\n" in patched_content
+    
+    # Ensure the old problematic values are completely gone
+    assert "3.5s" not in patched_content
+    assert "256MiB" not in patched_content
+    assert "long_name" not in patched_content

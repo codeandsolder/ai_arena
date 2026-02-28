@@ -107,8 +107,8 @@ def test_find_example_solution_prefers_named_keywords(tmp_path):
     sol_dir = tmp_path / "solution"
     sol_dir.mkdir()
     (sol_dir / "brute.cpp").write_text("// brute")
-    preferred = sol_dir / "sol_ac.cpp"
-    preferred.write_text("// ac")
+    preferred = sol_dir / "sol_correct.cpp"
+    preferred.write_text("// correct")
 
     result = _find_example_solution(tmp_path)
     assert result == preferred
@@ -392,6 +392,13 @@ async def test_run_task_maker_parses_json_output():
     with patch('backend.sandbox.benchmark.get_container_manager') as mock_get_manager:
         mock_manager = MagicMock()
         mock_manager.execute_command = AsyncMock(return_value=mock_result)
+        
+        # Mock container management methods
+        mock_container = AsyncMock()
+        mock_manager.create_container = AsyncMock(return_value=mock_container)
+        mock_manager.run_container = AsyncMock(return_value=mock_result)
+        mock_manager.cleanup_container = AsyncMock()
+        
         mock_get_manager.return_value = mock_manager
         
         with patch('backend.sandbox.benchmark._store_results', new_callable=AsyncMock):
@@ -450,6 +457,13 @@ async def test_run_task_maker_handles_all_verdicts():
     with patch('backend.sandbox.benchmark.get_container_manager') as mock_get_manager:
         mock_manager = MagicMock()
         mock_manager.execute_command = AsyncMock(return_value=mock_result)
+        
+        # Mock container management methods
+        mock_container = AsyncMock()
+        mock_manager.create_container = AsyncMock(return_value=mock_container)
+        mock_manager.run_container = AsyncMock(return_value=mock_result)
+        mock_manager.cleanup_container = AsyncMock()
+        
         mock_get_manager.return_value = mock_manager
         
         with patch('backend.sandbox.benchmark._store_results', new_callable=AsyncMock):
@@ -493,6 +507,13 @@ async def test_run_task_maker_no_evaluation_summary():
     with patch('backend.sandbox.benchmark.get_container_manager') as mock_get_manager:
         mock_manager = MagicMock()
         mock_manager.execute_command = AsyncMock(return_value=mock_result)
+        
+        # Mock container management methods
+        mock_container = AsyncMock()
+        mock_manager.create_container = AsyncMock(return_value=mock_container)
+        mock_manager.run_container = AsyncMock(return_value=mock_result)
+        mock_manager.cleanup_container = AsyncMock()
+        
         mock_get_manager.return_value = mock_manager
         
         with patch('backend.sandbox.benchmark._store_results', new_callable=AsyncMock):
@@ -527,6 +548,13 @@ async def test_run_task_maker_compilation_error():
     with patch('backend.sandbox.benchmark.get_container_manager') as mock_get_manager:
         mock_manager = MagicMock()
         mock_manager.execute_command = AsyncMock(return_value=mock_result)
+        
+        # Mock container management methods
+        mock_container = AsyncMock()
+        mock_manager.create_container = AsyncMock(return_value=mock_container)
+        mock_manager.run_container = AsyncMock(return_value=mock_result)
+        mock_manager.cleanup_container = AsyncMock()
+        
         mock_get_manager.return_value = mock_manager
         
         with tempfile.TemporaryDirectory() as problem_dir:
@@ -556,6 +584,13 @@ async def test_run_task_maker_no_test_results():
     with patch('backend.sandbox.benchmark.get_container_manager') as mock_get_manager:
         mock_manager = MagicMock()
         mock_manager.execute_command = AsyncMock(return_value=mock_result)
+        
+        # Mock container management methods
+        mock_container = AsyncMock()
+        mock_manager.create_container = AsyncMock(return_value=mock_container)
+        mock_manager.run_container = AsyncMock(return_value=mock_result)
+        mock_manager.cleanup_container = AsyncMock()
+        
         mock_get_manager.return_value = mock_manager
         
         with tempfile.TemporaryDirectory() as problem_dir:
@@ -591,6 +626,13 @@ async def test_run_task_maker_uses_time_field():
     with patch('backend.sandbox.benchmark.get_container_manager') as mock_get_manager:
         mock_manager = MagicMock()
         mock_manager.execute_command = AsyncMock(return_value=mock_result)
+        
+        # Mock container management methods
+        mock_container = AsyncMock()
+        mock_manager.create_container = AsyncMock(return_value=mock_container)
+        mock_manager.run_container = AsyncMock(return_value=mock_result)
+        mock_manager.cleanup_container = AsyncMock()
+        
         mock_get_manager.return_value = mock_manager
         
         with patch('backend.sandbox.benchmark._store_results', new_callable=AsyncMock):
@@ -628,6 +670,13 @@ async def test_run_task_maker_all_passed():
     with patch('backend.sandbox.benchmark.get_container_manager') as mock_get_manager:
         mock_manager = MagicMock()
         mock_manager.execute_command = AsyncMock(return_value=mock_result)
+        
+        # Mock container management methods
+        mock_container = AsyncMock()
+        mock_manager.create_container = AsyncMock(return_value=mock_container)
+        mock_manager.run_container = AsyncMock(return_value=mock_result)
+        mock_manager.cleanup_container = AsyncMock()
+        
         mock_get_manager.return_value = mock_manager
         
         with patch('backend.sandbox.benchmark._store_results', new_callable=AsyncMock):

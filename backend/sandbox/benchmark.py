@@ -511,9 +511,18 @@ async def _store_results(
 
 
 import shutil
+import re
+import json
+import tempfile
+from pathlib import Path
+from typing import Optional, Any, List
+from sqlalchemy.ext.asyncio import AsyncSession
+
+# (Assuming BenchmarkSummary, TestCaseResult, get_container_manager, _store_results are already imported)
 
 async def _run_task_maker(
     solution_id: int,
+    problem_id: int,
     source_code: str,
     problem_dir: str,
     memory_limit_mb: int = 256,
@@ -551,33 +560,93 @@ async def _run_task_maker(
         if base_file:
             shutil.copy2(repo_root / base_file, temp_repo / base_file)
             
-        # Copy the task directory to temp_repo/task
+        # Copy the task directory to temp_repo/task, excluding the original tc/ dir.
+        # We populate tc/ from the already-processed tests_dir instead (sync_tests has
+        # already downloaded and decompressed everything to plain N.in / N.out files).
         temp_task_dir = temp_repo / "task"
-        shutil.copytree(problem_path, temp_task_dir)
+        shutil.copytree(problem_path, temp_task_dir, ignore=shutil.ignore_patterns("tc"))
+
+        # Copy pre-processed test cases into tc/
+        from backend.services.problem_ingestion import get_problem_tests_dir
+        base_dir = Path(__file__).parent.parent.parent
+        tests_dir = base_dir / "backend" / "data"/ "problems" / str(problem_id) / "tests"
+        tc_dir = temp_task_dir / "tc"
+        tc_dir.mkdir()
+        test_count = 0
+        if tests_dir.exists():
+            for in_file in sorted(tests_dir.glob("*.in")):
+                out_file = in_file.with_suffix(".out")
+                if out_file.exists():
+                    shutil.copy2(in_file, tc_dir / in_file.name)
+                    shutil.copy2(out_file, tc_dir / out_file.name)
+                    test_count += 1
+            logger.info(f"Copied {test_count} pre-processed test case(s) from {tests_dir} into temp tc/")
+        else:
+            logger.warning(f"Pre-processed tests_dir not found at {tests_dir}; tc/ will be empty")
+
+        # ---------------------------------------------------------
+        # Patch task.yaml for tmc compatibility
+        # ---------------------------------------------------------
+        task_yaml_path = temp_task_dir / "task.yaml"
+        if task_yaml_path.exists():
+            content = task_yaml_path.read_text(encoding="utf-8")
+
+            # Remove 's' from time_limit (e.g., "3.0s" -> "3.0")
+            content = re.sub(r'(time_limit:\s*[\d\.]+)\s*s', r'\1', content)
+
+            # Remove units from memory_limit (e.g., "512MiB" -> "512")
+            content = re.sub(r'(memory_limit:\s*[\d\.]+)\s*[A-Za-z]+', r'\1', content)
+
+            # Replace long_name with title
+            if 'title:' not in content and 'long_name:' in content:
+                content = content.replace('long_name:', 'title:')
+
+            # Replace the subtasks block with a single subtask referencing the flat
+            # N.in / N.out files from sync_tests (original globs used .gz names).
+            subtasks_block = "subtasks:\n  - points: 100\n    testcases:\n"
+            for i in range(test_count):
+                subtasks_block += f"    - input: tc/{i}.in\n      output: tc/{i}.out\n"
+            content = re.sub(r'(?ms)^subtasks:.*', subtasks_block.rstrip(), content)
+
+            task_yaml_path.write_text(content, encoding="utf-8")
         
-        # Write the solution directly inside the task directory
+        # Write the solution directly inside the task's solution/ directory
+        sol_dir = temp_task_dir / "solution"
+        sol_dir.mkdir(exist_ok=True)
         solution_filename = "sandbox_solution.cpp"
-        source_path = temp_task_dir / solution_filename
+        source_path = sol_dir / solution_filename
         with open(source_path, "w", encoding="utf-8") as f:
             f.write(source_code)
             
-        # Mount the temp repo as RW (TMC compiles binaries and writes caches)
+        # Mount the temp repo as RW
         volumes = {
             str(temp_repo.absolute()): {"bind": "/repo", "mode": "rw"}
         }
         
-        command = ["tmc", "evaluate", "--ui", "json", solution_filename]
+        # Initialize Git at the ROOT of the repo so base-batch.yaml is tracked.
+        # Use `git add -f .` to forcefully bypass any .gitignore files hiding our testcases!
+        script = " ".join([
+            "tmc",
+            "-s", f"solution/{solution_filename}.cpp",
+            "-W", "StatementPresent",
+            "-W", "StatementValid",
+            "-W", "StatementCompiledOrGit",
+            "-W", "StatementSubtasks",
+            "-W", "AttNoDirectory",
+            "-W", "AttSampleFiles",
+            "--ui", "json"
+        ])
+        command = ["sh", "-c", script]
         
-        # Note: We manually create and run the container here because the 
-        # execute_command helper ignores working_dir, cap_add, and read_only flags.
         container = await container_manager.create_container(
             command=command,
             volumes=volumes,
             mem_limit=f"{memory_limit_mb + 512}m",
             network_disabled=True,
-            working_dir="/repo/task",      # Explicitly set the working directory
-            read_only=False,               # TMC needs write permissions here
-            cap_add=["SYS_ADMIN"]          # Isolate requires SYS_ADMIN capability
+            working_dir="/repo",
+            read_only=False,
+            cap_add=["SYS_ADMIN"],
+            user="root" # Required to manipulate docker volumes flawlessly
         )
         
         try:
@@ -588,9 +657,11 @@ async def _run_task_maker(
         if not result.success and not result.stdout:
              raise BenchmarkError(f"Task Maker execution failed: {result.error or 'Unknown error'}\nStderr: {result.stderr}")
 
-        # Parse tmc output (multiple JSON objects)
+        # Parse tmc output
         test_results: List[TestCaseResult] = []
+        subtask_results: List[TestCaseResult] = []
         final_summary = None
+        task_score = None
         
         for line in result.stdout.splitlines():
             line = line.strip()
@@ -600,7 +671,7 @@ async def _run_task_maker(
             try:
                 msg = json.loads(line)
                 
-                # Check for individual test results
+                # Check for individual granular test results
                 if "IOITestcaseScore" in msg:
                     data = msg["IOITestcaseScore"]
                     test_name = data.get("test_name", f"test_{len(test_results)+1}")
@@ -623,7 +694,7 @@ async def _run_task_maker(
                         passed=passed,
                         actual_output="",
                         time_ms=(data.get("time") or data.get("cpu_time") or 0.0) * 1000.0,
-                        memory_kb=data.get("memory", 0) // 1024, # B to KB
+                        memory_kb=data.get("memory", 0) // 1024,
                         exit_code=0 if passed else -1,
                         error="",
                         verdict=verdict
@@ -635,19 +706,63 @@ async def _run_task_maker(
                             await progress_callback(tc_result)
                         except Exception as e:
                             logger.warning(f"Progress callback failed: {e}")
-                    
+                            
+                # Collect subtask-level scores as fallback when no testcase scores appear
+                elif "IOISubtaskScore" in msg:
+                    data = msg["IOISubtaskScore"]
+                    subtask_id = data.get("subtask", len(subtask_results))
+                    normalized = data.get("normalized_score", 0.0)
+                    passed = normalized >= 1.0
+                    tc_result = TestCaseResult(
+                        test_index=len(subtask_results) + 1,
+                        test_name=f"subtask_{subtask_id}",
+                        passed=passed,
+                        actual_output="",
+                        time_ms=0.0,
+                        memory_kb=0,
+                        exit_code=0 if passed else -1,
+                        error="",
+                        verdict="AC" if passed else "WA"
+                    )
+                    subtask_results.append(tc_result)
+
                 # Check for evaluation summary
                 elif "IOIEvaluation" in msg:
                     final_summary = msg["IOIEvaluation"]
+
+                # Capture overall task score
+                elif "IOITaskScore" in msg:
+                    task_score = msg["IOITaskScore"].get("score", None)
                     
             except json.JSONDecodeError:
                 continue
-        
+
+        # If no per-testcase results but we have subtask results, use those
+        if not test_results and subtask_results:
+            logger.info(
+                f"No IOITestcaseScore messages found; using {len(subtask_results)} "
+                f"IOISubtaskScore entries as synthetic test results"
+            )
+            test_results = subtask_results
+            # Inject task score into final_summary so it propagates correctly
+            if task_score is not None and final_summary is None:
+                final_summary = {"score": task_score}
+            elif task_score is not None and final_summary is not None:
+                final_summary.setdefault("score", task_score)
+
+            if progress_callback:
+                for tc_result in test_results:
+                    try:
+                        await progress_callback(tc_result)
+                    except Exception as e:
+                        logger.warning(f"Progress callback failed: {e}")
+
+        # Strict requirement: if we have no test case results, something critically failed
         if not test_results:
              if "Compilation error" in result.stdout or "Compilation error" in result.stderr:
                  raise BenchmarkError(f"Compilation failed under Task Maker:\n{result.stdout}\n{result.stderr}")
-             raise BenchmarkError(f"Task Maker produced no test results. Output: {result.stdout[:500]} Stderr: {result.stderr[:500]}")
-
+             raise BenchmarkError(f"Task Maker produced no test results. Output: {result.stdout[:50000]} Stderr: {result.stderr[:50000]}")
+        print((f"Output: {result.stdout[:50000]} Stderr: {result.stderr[:50000]}"))
         # Aggregate summary
         tests_total = len(test_results)
         tests_passed = sum(1 for r in test_results if r.passed)
@@ -728,6 +843,7 @@ async def compile_and_benchmark(
         try:
             summary = await _run_task_maker(
                 solution_id=solution_id,
+                problem_id=problem_id,
                 source_code=source_code,
                 problem_dir=problem_dir,
                 memory_limit_mb=memory_limit_mb,

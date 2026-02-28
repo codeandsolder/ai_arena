@@ -90,15 +90,27 @@ def _find_example_solution(problem_path: Path, task_config=None) -> Optional[Pat
 
     all_sols = _find_all_solutions(problem_path, task_config)
     if all_sols:
-        # Prefer by verdict first (set from directory name during fallback scan), then
-        # by keywords in any part of the path (handles e.g. correct/main.cpp where the
-        # filename alone doesn't contain the keyword).
+        # Prefer by:
+        # 1. Explicit verdict == "correct"
+        # 2. Keywords in the filename itself
+        # 3. Keywords in any part of the path
+        # 4. Fallback to the first found
+        
         for sol in all_sols:
             if sol.expected_verdict == "correct":
                 return problem_path / sol.path
-            path_lower = sol.path.lower().replace("\\", "/")
-            if any(kw in path_lower for kw in ["correct", "sol", "reference", "example", "ac"]):
+        
+        keywords = ["correct", "ac", "sol", "reference", "example"]
+        
+        for sol in all_sols:
+            if any(kw in sol.name.lower() for kw in keywords):
                 return problem_path / sol.path
+                
+        for sol in all_sols:
+            path_lower = sol.path.lower().replace("\\", "/")
+            if any(kw in path_lower for kw in keywords):
+                return problem_path / sol.path
+                
         return problem_path / all_sols[0].path
     return None
 

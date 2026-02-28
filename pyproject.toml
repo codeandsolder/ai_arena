@@ -100,13 +100,13 @@ addopts = [
 
 [tool.coverage.run]
 source = ["backend"]
-branch = true                     # measure branch coverage, not just line coverage
+branch = true
 omit = ["tests/*"]
 
 [tool.coverage.report]
 show_missing = true
-skip_covered = false
-fail_under = 70                    # set to e.g. 80 to enforce a minimum threshold
+skip_covered = true
+fail_under = 70
 exclude_lines = [
     "pragma: no cover",
     "def __repr__",
@@ -120,4 +120,4 @@ exclude_lines = [
 [tool.coverage.html]
 directory = "coverage/html"
 title = "AI Optimization Arena – Coverage Report"
-show_contexts = true              # shows which tests covered each line
+show_contexts = true

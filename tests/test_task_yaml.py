@@ -186,14 +186,19 @@ def test_get_subtasks_and_patterns(tmp_path):
     config = TaskConfig(data, tmp_path)
     subtasks = config.get_subtasks()
     
-    assert len(subtasks) == 2
+    assert len(subtasks) == 3
     assert subtasks[0]["score"] == 30.0
     assert len(subtasks[0]["patterns"]) == 2
     assert subtasks[0]["patterns"][0] == {"input": "1.in", "output": "1.out"}
     
-    assert subtasks[1]["score"] == 0.0
-    assert len(subtasks[1]["patterns"]) == 1
-    assert subtasks[1]["patterns"][0] == {"input": "4.in", "output": "4.out"}
+    # Second subtask: "score": 70.5, but testcases list has one item with missing output.
+    # So patterns is empty. Score is valid.
+    assert subtasks[1]["score"] == 70.5
+    assert len(subtasks[1]["patterns"]) == 0
+    
+    # Third subtask: score "invalid" -> 0.0
+    assert subtasks[2]["score"] == 0.0
+    assert len(subtasks[2]["patterns"]) == 1
 
     # Also test get_test_patterns (similar logic but flat)
     patterns = config.get_test_patterns()

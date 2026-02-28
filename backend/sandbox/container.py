@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 # Default sandbox configuration
-DEFAULT_IMAGE = "arena-sandbox:v2"
+DEFAULT_IMAGE = "arena-sandbox"
 DEFAULT_MEMORY_LIMIT = "512m"  # 512 MB
 DEFAULT_CPU_PERIOD = 100000     # 100ms
 DEFAULT_CPU_QUOTA = 100000      # 100ms = 1 CPU
