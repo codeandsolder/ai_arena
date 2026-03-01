@@ -1035,85 +1035,85 @@ class OrchestrationEngine:
         """
         problem_dir = self._get_problem_dir(problem)
 
-    async def benchmark_single_protected(solution: Solution, binary_path: str):
-        # Use semaphore to ensure benchmarks don't interfere with each other's timing
-        async with self.benchmark_semaphore:
-            await self.websocket_manager.broadcast_solution_status(
-                run_id=run_id,
-                solution_id=solution.id,
-                model=solution.model_slug,
-                status="benchmarking"
-            )
-            
-            try:
-                # Check for TMC (task.yaml)
-                use_tmc = False
-                if problem_dir and os.path.exists(os.path.join(problem_dir, "task.yaml")):
-                    use_tmc = True
-                
-                if use_tmc:
-                        flags_list = shlex.split(solution.compiler_flags or "-O2 -std=c++20")
-                    success, message, summary = await compile_and_benchmark(
-                        solution_id=solution.id,
-                        source_code=solution.source_code or "",
-                        compiler=solution.compiler or "g++-14",
-                        compiler_flags=flags_list,
-                        test_cases_dir=test_cases_dir,
-                        problem_id=problem.id,
-                        time_limit_ms=problem.time_limit_ms,
-                        memory_limit_mb=problem.memory_limit_mb,
-                        db_session=db_session,
-                        problem_dir=problem_dir
-                    )
-                    if not success or not summary:
-                        raise Exception(f"TMC evaluation failed: {message}")
-                else:
-                    summary = await benchmark_solution(
-                        solution_id=solution.id,
-                        solution_binary_path=binary_path,
-                        test_cases_dir=test_cases_dir,
-                        time_limit_ms=problem.time_limit_ms,
-                        memory_limit_mb=problem.memory_limit_mb,
-                        db_session=db_session
-                    )
-                
-                # Broadcast test results
-                for result in summary.test_results:
-                    await self.websocket_manager.broadcast_test_result(
-                        run_id=run_id,
-                        solution_id=solution.id,
-                        test_index=result.test_index,
-                        verdict=result.verdict,
-                        time_ms=result.time_ms
-                    )
-                
-                # Update solution with benchmark metrics
-                solution.tests_passed = summary.tests_passed
-                solution.tests_total = summary.tests_total
-                solution.avg_time_ms = summary.avg_time_ms
-                solution.max_time_ms = summary.max_time_ms
-                solution.max_memory_kb = summary.max_memory_kb
-                solution.status = "completed" if summary.all_passed else "failed"
-                
+        async def benchmark_single_protected(solution: Solution, binary_path: str):
+            # Use semaphore to ensure benchmarks don't interfere with each other's timing
+            async with self.benchmark_semaphore:
                 await self.websocket_manager.broadcast_solution_status(
                     run_id=run_id,
                     solution_id=solution.id,
                     model=solution.model_slug,
-                    status=solution.status,
-                    details={
-                        "tests_passed": summary.tests_passed,
-                        "tests_total": summary.tests_total,
-                        "avg_time_ms": summary.avg_time_ms
-                    }
+                    status="benchmarking"
                 )
                 
-            except Exception as e:
-                logger.error(f"Benchmark failed for solution {solution.id}: {e}")
-                solution.status = "benchmark_failed"
-                solution.error_message = str(e)
-                
-    # Run protected benchmarks
-    tasks = [benchmark_single_protected(sol, path) for sol, path in compiled]
+                try:
+                    # Check for TMC (task.yaml)
+                    use_tmc = False
+                    if problem_dir and os.path.exists(os.path.join(problem_dir, "task.yaml")):
+                        use_tmc = True
+                    
+                    if use_tmc:
+                        flags_list = shlex.split(solution.compiler_flags or "-O2 -std=c++20")
+                        success, message, summary = await compile_and_benchmark(
+                            solution_id=solution.id,
+                            source_code=solution.source_code or "",
+                            compiler=solution.compiler or "g++-14",
+                            compiler_flags=flags_list,
+                            test_cases_dir=test_cases_dir,
+                            problem_id=problem.id,
+                            time_limit_ms=problem.time_limit_ms,
+                            memory_limit_mb=problem.memory_limit_mb,
+                            db_session=db_session,
+                            problem_dir=problem_dir
+                        )
+                        if not success or not summary:
+                            raise Exception(f"TMC evaluation failed: {message}")
+                    else:
+                        summary = await benchmark_solution(
+                            solution_id=solution.id,
+                            solution_binary_path=binary_path,
+                            test_cases_dir=test_cases_dir,
+                            time_limit_ms=problem.time_limit_ms,
+                            memory_limit_mb=problem.memory_limit_mb,
+                            db_session=db_session
+                        )
+                    
+                    # Broadcast test results
+                    for result in summary.test_results:
+                        await self.websocket_manager.broadcast_test_result(
+                            run_id=run_id,
+                            solution_id=solution.id,
+                            test_index=result.test_index,
+                            verdict=result.verdict,
+                            time_ms=result.time_ms
+                        )
+                    
+                    # Update solution with benchmark metrics
+                    solution.tests_passed = summary.tests_passed
+                    solution.tests_total = summary.tests_total
+                    solution.avg_time_ms = summary.avg_time_ms
+                    solution.max_time_ms = summary.max_time_ms
+                    solution.max_memory_kb = summary.max_memory_kb
+                    solution.status = "completed" if summary.all_passed else "failed"
+                    
+                    await self.websocket_manager.broadcast_solution_status(
+                        run_id=run_id,
+                        solution_id=solution.id,
+                        model=solution.model_slug,
+                        status=solution.status,
+                        details={
+                            "tests_passed": summary.tests_passed,
+                            "tests_total": summary.tests_total,
+                            "avg_time_ms": summary.avg_time_ms
+                        }
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Benchmark failed for solution {solution.id}: {e}")
+                    solution.status = "benchmark_failed"
+                    solution.error_message = str(e)
+                    
+        # Run protected benchmarks
+        tasks = [benchmark_single_protected(sol, path) for sol, path in compiled]
         await asyncio.gather(*tasks)
         
         await db_session.commit()
@@ -1169,7 +1169,7 @@ class OrchestrationEngine:
         # Score each solution
         for sol in solutions:
             # Check if solution passed compilation and all tests
-        	if sol.tests_total == 0:
+            if sol.tests_total == 0:
                 sol.score = 0.0
                 continue
             

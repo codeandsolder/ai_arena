@@ -125,7 +125,7 @@ async def test_tmc_task_grading():
             assert result.success, f"tmc execution failed with exit code {result.exit_code}. Output: {result.stdout}"
             if result.stdout:
                 assert "IOITaskScore" in result.stdout, f"Did not find expected JSON output from tmc. Output: {result.stdout}"
-            print(f"tmc grading test passed!")
+            print(f"tmc grading test passed: {result.stdout.strip() if result.stdout else '<no logs>'}")
             
         finally:
             loop = asyncio.get_event_loop()

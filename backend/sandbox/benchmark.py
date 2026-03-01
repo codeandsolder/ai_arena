@@ -643,7 +643,7 @@ async def _run_task_maker(
             volumes=volumes,
             mem_limit=f"{memory_limit_mb + 512}m",
             network_disabled=True,
-            working_dir="/repo",
+            working_dir="/repo/task",
             read_only=False,
             cap_add=["SYS_ADMIN"],
             user="root" # Required to manipulate docker volumes flawlessly

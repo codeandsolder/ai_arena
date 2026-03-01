@@ -96,3 +96,4 @@ dist-ssr/
 *.tmp
 .cache/
 backend/data/*
+cms/
